@@ -368,6 +368,19 @@ class ScheduleApp:
         dlg.bind("<Return>", lambda _event: submit())
         dlg.bind("<Escape>", lambda _event: cancel())
 
+        # Center dialog relative to the main window
+        dlg.update_idletasks()
+        self.root.update_idletasks()
+        root_x = self.root.winfo_rootx()
+        root_y = self.root.winfo_rooty()
+        root_w = self.root.winfo_width()
+        root_h = self.root.winfo_height()
+        dlg_w = dlg.winfo_width()
+        dlg_h = dlg.winfo_height()
+        x = root_x + max((root_w - dlg_w) // 2, 0)
+        y = root_y + max((root_h - dlg_h) // 2, 0)
+        dlg.geometry(f"+{x}+{y}")
+
     # ----- splitter -----
     def _on_splitter_press(self, event: tk.Event) -> None:
         self._drag_start_x = event.x_root
