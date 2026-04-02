@@ -1,22 +1,27 @@
 import json
 import os
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 import tkinter as tk
 from tkinter import font as tkfont
 from tkinter import messagebox
 
 
 DATA_FILE = os.path.join(os.path.dirname(__file__), "schedules.json")
+COMPLETE_LOG_FILE = os.path.join(os.path.dirname(__file__), "completed_tasks.jsonl")
 
 TITLE_APP = "\u30b7\u30f3\u30d7\u30eb\u30fb\u30b9\u30b1\u30b8\u30e5\u30fc\u30eb\uff08\u30ac\u30f3\u30c8\uff09"
 LABEL_VISIBILITY = "\u8868\u793a\u53ef\u5426"
 LABEL_TASK = "\u30bf\u30b9\u30af"
+LABEL_COMPLETE = "\u5b8c\u4e86"
 LABEL_GANTT = "\u30ac\u30f3\u30c8\u30c1\u30e3\u30fc\u30c8"
 TEXT_ADD = "\u8ffd\u52a0"
 TEXT_DELETE = "\u524a\u9664"
 TEXT_UP = "\u4e0a\u3078"
 TEXT_DOWN = "\u4e0b\u3078"
+TEXT_COMPLETE = "\u5b8c\u4e86"
+COMPLETE_BUTTON_WIDTH = 8
+TEXT_RELOAD_INCOMPLETE = "\u672a\u5b8c\u4e86\u30bf\u30b9\u30af\u306e\u518d\u8aad\u307f\u8fbc\u307f"
 VISIBLE_TEXT = "\u8868\u793a"
 HIDDEN_TEXT = "\u975e\u8868\u793a"
 DIALOG_ADD_TITLE = "\u30b9\u30b1\u30b8\u30e5\u30fc\u30eb\u8ffd\u52a0"
@@ -32,6 +37,23 @@ ERROR_EMPTY_TASK = "\u30bf\u30b9\u30af\u540d\u3092\u5165\u529b\u3057\u3066\u304f
 ERROR_INVALID_DATE = "\u65e5\u4ed8\u306fYYYY-MM-DD\u5f62\u5f0f\u3067\u5165\u529b\u3057\u3066\u304f\u3060\u3055\u3044\u3002"
 ERROR_LOAD = "\u30c7\u30fc\u30bf\u306e\u8aad\u307f\u8fbc\u307f\u306b\u5931\u6557\u3057\u307e\u3057\u305f\u3002"
 ERROR_SAVE = "\u30c7\u30fc\u30bf\u306e\u4fdd\u5b58\u306b\u5931\u6557\u3057\u307e\u3057\u305f\u3002"
+ERROR_COMPLETE_LOG_WRITE = "\u5b8c\u4e86\u30ed\u30b0\u306e\u66f8\u304d\u8fbc\u307f\u306b\u5931\u6557\u3057\u307e\u3057\u305f\u3002"
+ERROR_COMPLETE_LOG_READ = "\u5b8c\u4e86\u30ed\u30b0\u306e\u8aad\u307f\u8fbc\u307f\u306b\u5931\u6557\u3057\u307e\u3057\u305f\u3002"
+CONFIRM_COMPLETE_TITLE = "\u5b8c\u4e86\u78ba\u8a8d"
+CONFIRM_COMPLETE_MESSAGE = "\u300c{task}\u300d\u3092\u5b8c\u4e86\u306b\u3057\u307e\u3059\u304b\uff1f"
+LOG_FIELD_TASK = "\u30bf\u30b9\u30af\u540d"
+LOG_FIELD_START = "\u958b\u59cb\u65e5"
+LOG_FIELD_END = "\u7d42\u4e86\u65e5"
+LOG_FIELD_COMPLETED_AT = "\u5b8c\u4e86\u65e5\u6642"
+LOG_FIELD_COMPLETED = "\u5b8c\u4e86\u72b6\u614b"
+JST = timezone(timedelta(hours=9))
+JST_MONITOR_MS = 30_000
+TODAY_HIGHLIGHT_BG = "#ffb8b8"
+TODAY_LINE_COLOR = "#ff0000"
+
+
+def today_in_jst() -> date:
+    return datetime.now(JST).date()
 
 
 def parse_date(value: str) -> date:
@@ -40,6 +62,14 @@ def parse_date(value: str) -> date:
 
 def format_date(value: date) -> str:
     return value.strftime("%Y-%m-%d")
+
+
+def current_jst_timestamp() -> str:
+    return datetime.now(JST).isoformat(timespec="seconds")
+
+
+def entry_key(task: str, start: date, end: date) -> tuple[str, str, str]:
+    return task, format_date(start), format_date(end)
 
 
 @dataclass
@@ -63,9 +93,12 @@ class ScheduleApp:
 
         self.task_font = tkfont.nametofont("TkDefaultFont")
         self.task_column_width = 260
+        self.complete_column_width = self._measure_complete_button_width()
         self.splitter_width = 6
         self._drag_start_x: int | None = None
         self._drag_start_width: int | None = None
+        self.current_jst_date = today_in_jst()
+        self.today_label_screen_x: float | None = None
 
         self._build_ui()
         self._load()
@@ -73,6 +106,15 @@ class ScheduleApp:
         self._rebuild_rows()
         self.root.after(100, self._redraw_scale)
         self.root.after(100, self._redraw_all_gantt)
+        self.root.after(JST_MONITOR_MS, self._monitor_jst_date)
+
+    def _monitor_jst_date(self) -> None:
+        latest = today_in_jst()
+        if latest != self.current_jst_date:
+            self.current_jst_date = latest
+            self._redraw_scale()
+            self._redraw_all_gantt()
+        self.root.after(JST_MONITOR_MS, self._monitor_jst_date)
 
     # ----- persistence -----
     def _load(self) -> None:
@@ -117,6 +159,73 @@ class ScheduleApp:
         except Exception as exc:
             messagebox.showerror(ERROR_INPUT_TITLE, f"{ERROR_SAVE}\n{exc}")
 
+    def _append_completion_log(self, entry: dict) -> bool:
+        record = {
+            LOG_FIELD_TASK: entry["task"],
+            LOG_FIELD_START: format_date(entry["start"]),
+            LOG_FIELD_END: format_date(entry["end"]),
+            LOG_FIELD_COMPLETED_AT: current_jst_timestamp(),
+            LOG_FIELD_COMPLETED: True,
+        }
+        try:
+            with open(COMPLETE_LOG_FILE, "a", encoding="utf-8", newline="\n") as fh:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception as exc:
+            messagebox.showerror(ERROR_INPUT_TITLE, f"{ERROR_COMPLETE_LOG_WRITE}\n{exc}")
+            return False
+        return True
+
+    def _load_latest_completion_states(self) -> dict[tuple[str, str, str], dict] | None:
+        if not os.path.exists(COMPLETE_LOG_FILE):
+            return {}
+
+        latest_records: dict[tuple[str, str, str], dict] = {}
+        try:
+            with open(COMPLETE_LOG_FILE, "r", encoding="utf-8") as fh:
+                for line_no, line in enumerate(fh, start=1):
+                    text = line.strip()
+                    if not text:
+                        continue
+
+                    try:
+                        raw = json.loads(text)
+                    except json.JSONDecodeError as exc:
+                        raise ValueError(f"{line_no}\u884c\u76ee: JSON\u306e\u89e3\u6790\u306b\u5931\u6557\u3057\u307e\u3057\u305f\u3002 {exc}") from exc
+
+                    if not isinstance(raw, dict):
+                        raise ValueError(f"{line_no}\u884c\u76ee: JSON\u30aa\u30d6\u30b8\u30a7\u30af\u30c8\u3092\u8a18\u8f09\u3057\u3066\u304f\u3060\u3055\u3044\u3002")
+
+                    missing = [
+                        field
+                        for field in (LOG_FIELD_TASK, LOG_FIELD_START, LOG_FIELD_END, LOG_FIELD_COMPLETED_AT, LOG_FIELD_COMPLETED)
+                        if field not in raw
+                    ]
+                    if missing:
+                        raise ValueError(
+                            f"{line_no}\u884c\u76ee: \u5fc5\u9808\u30ad\u30fc\u304c\u4e0d\u8db3\u3057\u3066\u3044\u307e\u3059\u3002 {', '.join(missing)}"
+                        )
+
+                    task = str(raw[LOG_FIELD_TASK])
+                    try:
+                        start = parse_date(str(raw[LOG_FIELD_START]))
+                        end = parse_date(str(raw[LOG_FIELD_END]))
+                    except Exception as exc:
+                        raise ValueError(f"{line_no}\u884c\u76ee: \u958b\u59cb\u65e5\u307e\u305f\u306f\u7d42\u4e86\u65e5\u304c\u4e0d\u6b63\u3067\u3059\u3002") from exc
+
+                    key = entry_key(task, start, end)
+                    latest_records.pop(key, None)
+                    latest_records[key] = {
+                        "task": task,
+                        "start": start,
+                        "end": end,
+                        LOG_FIELD_COMPLETED: raw[LOG_FIELD_COMPLETED],
+                    }
+        except Exception as exc:
+            messagebox.showerror(ERROR_INPUT_TITLE, f"{ERROR_COMPLETE_LOG_READ}\n{exc}")
+            return None
+
+        return latest_records
+
     # ----- UI construction -----
     def _build_ui(self) -> None:
         self.root.columnconfigure(0, weight=1)
@@ -124,32 +233,35 @@ class ScheduleApp:
 
         button_frame = tk.Frame(self.root)
         button_frame.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
-        for col in range(4):
+        for col in range(5):
             button_frame.columnconfigure(col, weight=0)
 
         tk.Button(button_frame, text=TEXT_ADD, command=self._on_add).grid(row=0, column=0, padx=(0, 6))
         tk.Button(button_frame, text=TEXT_DELETE, command=self._on_delete).grid(row=0, column=1, padx=(0, 6))
         tk.Button(button_frame, text=TEXT_UP, command=self._on_up).grid(row=0, column=2, padx=(0, 6))
-        tk.Button(button_frame, text=TEXT_DOWN, command=self._on_down).grid(row=0, column=3)
+        tk.Button(button_frame, text=TEXT_DOWN, command=self._on_down).grid(row=0, column=3, padx=(0, 6))
+        tk.Button(button_frame, text=TEXT_RELOAD_INCOMPLETE, command=self._on_reload_incomplete_tasks).grid(row=0, column=4)
 
         header = tk.Frame(self.root)
         header.grid(row=1, column=0, sticky="ew", padx=8)
         header.columnconfigure(0, weight=0)
         header.columnconfigure(1, weight=0)
-        header.columnconfigure(2, weight=0)
-        header.columnconfigure(3, weight=1)
+        header.columnconfigure(2, weight=0, minsize=self.complete_column_width)
+        header.columnconfigure(3, weight=0)
+        header.columnconfigure(4, weight=1)
 
         tk.Label(header, text=LABEL_VISIBILITY, width=6, anchor="w").grid(row=0, column=0, sticky="w", padx=(4, 8))
         self.task_header_label = tk.Label(header, text=LABEL_TASK, anchor="w")
         self.task_header_label.grid(row=0, column=1, sticky="ew", padx=(0, 8))
-        tk.Label(header, text=LABEL_GANTT, anchor="w").grid(row=0, column=3, sticky="w")
+        tk.Label(header, text=LABEL_COMPLETE, anchor="w").grid(row=0, column=2, sticky="w", padx=(0, 8))
+        tk.Label(header, text=LABEL_GANTT, anchor="w").grid(row=0, column=4, sticky="w")
 
         self.scale_canvas = tk.Canvas(header, height=54, highlightthickness=0, background=self.root.cget("bg"))
-        self.scale_canvas.grid(row=1, column=3, sticky="ew", pady=(2, 0), padx=(0, 4))
+        self.scale_canvas.grid(row=1, column=4, sticky="ew", pady=(2, 0), padx=(0, 4))
         self.scale_canvas.bind("<Configure>", lambda _event: self._redraw_scale())
 
         self.splitter = tk.Frame(header, width=self.splitter_width, cursor="sb_h_double_arrow", bg="#d0d0d0")
-        self.splitter.grid(row=0, column=2, rowspan=2, sticky="ns")
+        self.splitter.grid(row=0, column=3, rowspan=2, sticky="ns")
         self.splitter.bind("<Button-1>", self._on_splitter_press)
         self.splitter.bind("<B1-Motion>", self._on_splitter_drag)
         self.splitter.bind("<ButtonRelease-1>", self._on_splitter_release)
@@ -164,10 +276,18 @@ class ScheduleApp:
     def _apply_column_width(self) -> None:
         header = self.task_header_label.nametowidget(self.task_header_label.winfo_parent())
         header.columnconfigure(1, minsize=self.task_column_width)
+        header.columnconfigure(2, minsize=self.complete_column_width)
         for widgets in self.row_widgets:
             widgets.container.columnconfigure(1, minsize=self.task_column_width)
+            widgets.container.columnconfigure(2, minsize=self.complete_column_width)
             widgets.task_frame.configure(width=self.task_column_width)
             widgets.task_frame.grid_propagate(False)
+
+    def _measure_complete_button_width(self) -> int:
+        probe = tk.Button(self.root, text=TEXT_COMPLETE, width=COMPLETE_BUTTON_WIDTH)
+        width = probe.winfo_reqwidth()
+        probe.destroy()
+        return width
 
     def _update_initial_task_width(self) -> None:
         if not self.entries:
@@ -220,6 +340,14 @@ class ScheduleApp:
         task_label.pack(fill="both", expand=True)
         task_label.bind("<Button-1>", lambda _event, idx=index: self._select(idx))
         task_label.bind("<Double-1>", lambda _event, idx=index: self._on_edit(idx))
+
+        complete_button = tk.Button(
+            row,
+            text=TEXT_COMPLETE,
+            width=COMPLETE_BUTTON_WIDTH,
+            command=lambda idx=index: self._on_complete(idx),
+        )
+        complete_button.grid(row=0, column=2, sticky="w", padx=(0, 8), pady=2)
 
         gantt_canvas = tk.Canvas(row, height=28, background="#ffffff", highlightthickness=0)
         gantt_canvas.grid(row=0, column=3, sticky="ew", padx=(0, 4), pady=2)
@@ -283,6 +411,47 @@ class ScheduleApp:
         self._save()
         self._rebuild_rows()
 
+    def _on_complete(self, index: int) -> None:
+        if not (0 <= index < len(self.entries)):
+            return
+        entry = self.entries[index]
+        confirmed = messagebox.askyesno(CONFIRM_COMPLETE_TITLE, CONFIRM_COMPLETE_MESSAGE.format(task=entry["task"]))
+        if not confirmed:
+            return
+        if not self._append_completion_log(entry):
+            return
+
+        del self.entries[index]
+        self.selected_index = min(index, len(self.entries) - 1) if self.entries else None
+        self._save()
+        self._rebuild_rows()
+
+    def _on_reload_incomplete_tasks(self) -> None:
+        latest_records = self._load_latest_completion_states()
+        if latest_records is None:
+            return
+
+        existing_keys = {entry_key(entry["task"], entry["start"], entry["end"]) for entry in self.entries}
+        restored = False
+        for key, record in latest_records.items():
+            if record[LOG_FIELD_COMPLETED] is True or key in existing_keys:
+                continue
+            self.entries.append(
+                {
+                    "task": record["task"],
+                    "start": record["start"],
+                    "end": record["end"],
+                    "visible": True,
+                }
+            )
+            existing_keys.add(key)
+            self._ensure_task_width(record["task"])
+            restored = True
+
+        if restored:
+            self._save()
+            self._rebuild_rows()
+
     def _toggle_visibility(self, index: int) -> None:
         if not (0 <= index < len(self.entries)):
             return
@@ -315,7 +484,7 @@ class ScheduleApp:
             start_var.set(format_date(entry["start"]))
             end_var.set(format_date(entry["end"]))
         else:
-            today = date.today()
+            today = today_in_jst()
             start_var.set(format_date(today))
             end_var.set(format_date(today))
 
@@ -425,8 +594,6 @@ class ScheduleApp:
         if not (0 <= index < len(self.entries)):
             return
         entry = self.entries[index]
-        if not entry.get("visible", True):
-            return
 
         width = canvas.winfo_width()
         height = canvas.winfo_height()
@@ -448,26 +615,37 @@ class ScheduleApp:
         def x_for(idx_value: int | float) -> float:
             return pad + usable_w * (idx_value / vis_days)
 
-        start_idx = (entry["start"] - start_all).days
-        span_days = (entry["end"] - entry["start"]).days + 1
-        end_idx = start_idx + span_days
+        if entry.get("visible", True):
+            start_idx = (entry["start"] - start_all).days
+            span_days = (entry["end"] - entry["start"]).days + 1
+            end_idx = start_idx + span_days
 
-        start_idx = max(0, min(vis_days, start_idx))
-        end_idx = max(0, min(vis_days, end_idx))
+            start_idx = max(0, min(vis_days, start_idx))
+            end_idx = max(0, min(vis_days, end_idx))
 
-        x0 = x_for(start_idx)
-        x1 = x_for(end_idx)
-        if x1 <= x0:
-            x1 = min(width - pad, x0 + 1)
-        y0, y1 = 4, height - 4
-        canvas.create_rectangle(x0, y0, x1, y1, fill="#4caf50", outline="")
-        canvas.create_text((x0 + x1) / 2, (y0 + y1) / 2, text=str(span_days), fill="white")
+            x0 = x_for(start_idx)
+            x1 = x_for(end_idx)
+            if x1 <= x0:
+                x1 = min(width - pad, x0 + 1)
+            y0, y1 = 4, height - 4
+            canvas.create_rectangle(x0, y0, x1, y1, fill="#4caf50", outline="")
+            canvas.create_text((x0 + x1) / 2, (y0 + y1) / 2, text=str(span_days), fill="white")
+
+        if start_all <= self.current_jst_date <= end_all:
+            if self.today_label_screen_x is not None:
+                x_today = self.today_label_screen_x - canvas.winfo_rootx()
+            else:
+                today_idx = (self.current_jst_date - start_all).days + 0.5
+                x_today = x_for(today_idx)
+            x_today = max(0, min(width, x_today))
+            canvas.create_line(x_today, 0, x_today, height, fill=TODAY_LINE_COLOR, width=2)
 
     def _redraw_scale(self) -> None:
         if not hasattr(self, "scale_canvas"):
             return
         canvas = self.scale_canvas
         canvas.delete("all")
+        self.today_label_screen_x = None
 
         width = canvas.winfo_width()
         height = canvas.winfo_height()
@@ -525,18 +703,50 @@ class ScheduleApp:
         min_spacing = 24
         step = max(1, int((min_spacing / px_per_day) + 0.999))
         day_cursor = start_all
-        while day_cursor <= end_all:
-            idx_value = (day_cursor - start_all).days
+
+        def draw_day_label(day_value: date) -> None:
+            idx_value = (day_value - start_all).days
             x = x_for(idx_value)
+            is_today = day_value == self.current_jst_date
             canvas.create_line(x, height - 18, x, height - 1, fill="#999999")
-            canvas.create_text(x, y_day, text=str(day_cursor.day), anchor="s")
+            label = canvas.create_text(
+                x,
+                y_day,
+                text=str(day_value.day),
+                anchor="s",
+                fill="black",
+            )
+            if is_today:
+                bbox = canvas.bbox(label)
+                if bbox:
+                    self.today_label_screen_x = canvas.winfo_rootx() + ((bbox[0] + bbox[2]) / 2)
+                    highlight = canvas.create_rectangle(
+                        bbox[0] - 2,
+                        bbox[1] - 1,
+                        bbox[2] + 2,
+                        bbox[3] + 1,
+                        fill=TODAY_HIGHLIGHT_BG,
+                        outline="",
+                    )
+                    canvas.tag_lower(highlight, label)
+                else:
+                    self.today_label_screen_x = canvas.winfo_rootx() + x
+
+        while day_cursor <= end_all:
+            draw_day_label(day_cursor)
             day_cursor += timedelta(days=step)
+
+        if start_all <= self.current_jst_date <= end_all:
+            cursor_offset = (self.current_jst_date - start_all).days % step
+            if cursor_offset != 0:
+                draw_day_label(self.current_jst_date)
 
         final_day = end_all + timedelta(days=1)
         x_last = x_for(vis_days)
         canvas.create_line(x_last, height - 18, x_last, height - 1, fill="#999999")
         canvas.create_text(x_last, y_day, text=str(final_day.day), anchor="s")
         canvas.create_line(pad, height - 1, width - pad, height - 1, fill="#bdbdbd")
+        self._redraw_all_gantt()
 
 
 def main() -> None:
