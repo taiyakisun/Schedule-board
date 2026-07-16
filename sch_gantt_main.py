@@ -109,32 +109,35 @@ LOG_FIELD_PROGRESS_TOTAL = "進捗分母"
 JST = timezone(timedelta(hours=9))
 JST_MONITOR_MS = 30_000
 
-COLOR_APP_BG = "#F4F7FB"
+COLOR_APP_BG = "#F7F7F5"
 COLOR_SURFACE = "#FFFFFF"
-COLOR_SURFACE_ALT = "#F8FAFC"
-COLOR_HEADER = "#E8EEF7"
-COLOR_TEXT = "#1F2937"
-COLOR_TEXT_MUTED = "#64748B"
-COLOR_BORDER = "#CBD5E1"
-COLOR_BORDER_SOFT = "#E2E8F0"
-COLOR_PRIMARY = "#2563EB"
-COLOR_PRIMARY_HOVER = "#1D4ED8"
-COLOR_PRIMARY_SOFT = "#DBEAFE"
-COLOR_SELECTED_GANTT = "#EFF6FF"
-COLOR_DANGER = "#DC2626"
-COLOR_DANGER_HOVER = "#B91C1C"
-COLOR_DANGER_SOFT = "#FEE2E2"
-COLOR_SUCCESS = "#16A34A"
-COLOR_SUCCESS_HOVER = "#15803D"
-COLOR_SUCCESS_SOFT = "#DCFCE7"
-COLOR_WARNING = "#D97706"
-COLOR_WARNING_SOFT = "#FEF3C7"
-COLOR_PARENT_REMAINING = "#93C5FD"
-COLOR_PARENT_COMPLETE = "#2563EB"
-COLOR_CHILD_REMAINING = "#BBF7D0"
-COLOR_CHILD_COMPLETE = "#16A34A"
-TODAY_HIGHLIGHT_BG = "#FEE2E2"
-TODAY_LINE_COLOR = "#EF4444"
+COLOR_SURFACE_ALT = "#FAFAF8"
+COLOR_HEADER = "#F1F1EE"
+COLOR_TEXT = "#202124"
+COLOR_TEXT_MUTED = "#6B6B66"
+COLOR_BORDER = "#D8D7D2"
+COLOR_BORDER_SOFT = "#E8E7E3"
+COLOR_GRID = "#F0EFEC"
+COLOR_PRIMARY = "#5B5CE2"
+COLOR_PRIMARY_HOVER = "#4748C8"
+COLOR_PRIMARY_SOFT = "#EEEEFF"
+COLOR_SELECTED_GANTT = "#F6F5FF"
+COLOR_DANGER = "#B42318"
+COLOR_DANGER_HOVER = "#8F1C14"
+COLOR_DANGER_SOFT = "#FFF1F0"
+COLOR_SUCCESS = "#166534"
+COLOR_SUCCESS_HOVER = "#14532D"
+COLOR_SUCCESS_SOFT = "#ECFDF3"
+COLOR_WARNING = "#92400E"
+COLOR_WARNING_SOFT = "#FFFBEB"
+COLOR_PARENT_REMAINING = "#C7D2FE"
+COLOR_PARENT_COMPLETE = "#5B5CE2"
+COLOR_CHILD_REMAINING = "#BDEBDD"
+COLOR_CHILD_COMPLETE = "#0F9F6E"
+COLOR_WEEKEND = "#F7F6F3"
+COLOR_SELECTED_WEEKEND = "#EFEEFA"
+TODAY_HIGHLIGHT_BG = "#FFF0EE"
+TODAY_LINE_COLOR = "#E5484D"
 
 
 def today_in_jst() -> date:
@@ -291,14 +294,19 @@ class ScheduleApp:
             "Primary.TButton",
             background=COLOR_PRIMARY,
             foreground="white",
-            borderwidth=0,
-            focusthickness=0,
+            bordercolor=COLOR_PRIMARY,
+            lightcolor=COLOR_PRIMARY,
+            darkcolor=COLOR_PRIMARY,
+            borderwidth=1,
+            focusthickness=2,
+            focuscolor=COLOR_PRIMARY_HOVER,
             padding=(14, 8),
             font=self.button_font,
         )
         self.style.map(
             "Primary.TButton",
             background=[("pressed", COLOR_PRIMARY_HOVER), ("active", COLOR_PRIMARY_HOVER)],
+            bordercolor=[("focus", COLOR_TEXT), ("pressed", COLOR_PRIMARY_HOVER)],
         )
         self.style.configure(
             "Secondary.TButton",
@@ -308,13 +316,15 @@ class ScheduleApp:
             lightcolor=COLOR_BORDER,
             darkcolor=COLOR_BORDER,
             borderwidth=1,
-            focusthickness=0,
+            focusthickness=2,
+            focuscolor=COLOR_PRIMARY,
             padding=(12, 7),
             font=self.button_font,
         )
         self.style.map(
             "Secondary.TButton",
             background=[("pressed", COLOR_HEADER), ("active", COLOR_SURFACE_ALT)],
+            bordercolor=[("focus", COLOR_PRIMARY), ("active", COLOR_BORDER)],
         )
         self.style.configure(
             "Danger.TButton",
@@ -324,14 +334,16 @@ class ScheduleApp:
             lightcolor=COLOR_DANGER_SOFT,
             darkcolor=COLOR_DANGER_SOFT,
             borderwidth=1,
-            focusthickness=0,
+            focusthickness=2,
+            focuscolor=COLOR_DANGER,
             padding=(12, 7),
             font=self.button_font,
         )
         self.style.map(
             "Danger.TButton",
-            background=[("pressed", "#FECACA"), ("active", "#FECACA")],
+            background=[("pressed", "#FFE4E1"), ("active", "#FFE4E1")],
             foreground=[("pressed", COLOR_DANGER_HOVER), ("active", COLOR_DANGER_HOVER)],
+            bordercolor=[("focus", COLOR_DANGER)],
         )
         self.style.configure(
             "Success.TButton",
@@ -341,14 +353,16 @@ class ScheduleApp:
             lightcolor=COLOR_SUCCESS_SOFT,
             darkcolor=COLOR_SUCCESS_SOFT,
             borderwidth=1,
-            focusthickness=0,
+            focusthickness=2,
+            focuscolor=COLOR_SUCCESS,
             padding=(10, 5),
             font=self.button_font,
         )
         self.style.map(
             "Success.TButton",
-            background=[("pressed", "#BBF7D0"), ("active", "#BBF7D0")],
+            background=[("pressed", "#D1FAE5"), ("active", "#D1FAE5")],
             foreground=[("pressed", COLOR_SUCCESS_HOVER), ("active", COLOR_SUCCESS_HOVER)],
+            bordercolor=[("focus", COLOR_SUCCESS)],
         )
         self.style.configure(
             "Modern.TEntry",
@@ -358,12 +372,21 @@ class ScheduleApp:
             lightcolor=COLOR_BORDER,
             darkcolor=COLOR_BORDER,
             insertcolor=COLOR_TEXT,
+            focusthickness=2,
+            focuscolor=COLOR_PRIMARY,
             padding=7,
+        )
+        self.style.map(
+            "Modern.TEntry",
+            bordercolor=[("focus", COLOR_PRIMARY)],
+            lightcolor=[("focus", COLOR_PRIMARY)],
+            darkcolor=[("focus", COLOR_PRIMARY)],
         )
         self.style.configure(
             "Modern.TRadiobutton",
             background=COLOR_SURFACE,
             foreground=COLOR_TEXT,
+            focuscolor=COLOR_PRIMARY,
             padding=(0, 4),
         )
         self.style.map(
@@ -567,9 +590,18 @@ class ScheduleApp:
         )
         topbar.grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 10))
         topbar.columnconfigure(0, weight=1)
+        tk.Frame(topbar, width=4, bg=COLOR_PRIMARY).place(x=0, y=0, relheight=1)
 
         brand_frame = tk.Frame(topbar, bg=COLOR_SURFACE)
         brand_frame.grid(row=0, column=0, sticky="w", padx=20, pady=(16, 8))
+        tk.Label(
+            brand_frame,
+            text="PROJECT TIMELINE",
+            bg=COLOR_SURFACE,
+            fg=COLOR_PRIMARY,
+            font=self.small_font,
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w", pady=(0, 3))
         tk.Label(
             brand_frame,
             text="Schedule Board",
@@ -577,7 +609,7 @@ class ScheduleApp:
             fg=COLOR_TEXT,
             font=self.title_font,
             anchor="w",
-        ).grid(row=0, column=0, sticky="w")
+        ).grid(row=1, column=0, sticky="w")
         tk.Label(
             brand_frame,
             text="タスクと進捗を、ひとつのタイムラインで管理",
@@ -585,7 +617,7 @@ class ScheduleApp:
             fg=COLOR_TEXT_MUTED,
             font=self.subtitle_font,
             anchor="w",
-        ).grid(row=1, column=0, sticky="w", pady=(2, 0))
+        ).grid(row=2, column=0, sticky="w", pady=(2, 0))
 
         overview_frame = tk.Frame(topbar, bg=COLOR_SURFACE)
         overview_frame.grid(row=0, column=1, sticky="e", padx=20, pady=(16, 8))
@@ -601,12 +633,14 @@ class ScheduleApp:
         self.today_label = tk.Label(
             overview_frame,
             text=self.current_jst_date.strftime("%Y年%m月%d日"),
-            bg=COLOR_SURFACE,
-            fg=COLOR_TEXT_MUTED,
+            bg=COLOR_PRIMARY_SOFT,
+            fg=COLOR_PRIMARY,
             font=self.small_font,
             anchor="e",
+            padx=8,
+            pady=3,
         )
-        self.today_label.grid(row=1, column=0, sticky="e", pady=(3, 0))
+        self.today_label.grid(row=1, column=0, sticky="e", pady=(6, 0))
 
         button_frame = tk.Frame(topbar, bg=COLOR_SURFACE)
         button_frame.grid(row=1, column=0, columnspan=2, sticky="ew", padx=20, pady=(4, 16))
@@ -686,7 +720,7 @@ class ScheduleApp:
             self.header,
             height=58,
             highlightthickness=0,
-            background=COLOR_SURFACE,
+            background=COLOR_HEADER,
         )
         self.scale_canvas.grid(row=1, column=6, sticky="ew", padx=(0, 4))
         self.scale_canvas.bind("<Configure>", lambda _event: self._redraw_scale())
@@ -695,7 +729,7 @@ class ScheduleApp:
             self.header,
             width=self.splitter_width,
             cursor="sb_h_double_arrow",
-            bg=COLOR_BORDER,
+            bg=COLOR_BORDER_SOFT,
         )
         self.splitter.grid(row=0, column=5, rowspan=2, sticky="ns")
         self.splitter.bind("<Button-1>", self._on_splitter_press)
@@ -832,9 +866,15 @@ class ScheduleApp:
         if not hasattr(self, "summary_label"):
             return
         parent_count = len(self.entries)
-        task_count = sum(1 for _entry in iter_all_entries(self.schedule))
+        tasks = list(iter_all_entries(self.schedule))
+        task_count = len(tasks)
+        average_progress = (
+            sum(progress_ratio(entry) for entry in tasks) / task_count
+            if task_count
+            else 0
+        )
         self.summary_label.configure(
-            text=f"{parent_count}グループ  •  {task_count}タスク"
+            text=f"{parent_count}グループ  ·  {task_count}タスク  ·  平均 {average_progress:.0%}"
         )
 
     def _show_empty_state(self) -> None:
@@ -884,18 +924,21 @@ class ScheduleApp:
         row.bind("<Button-1>", lambda _event, item_id=entry_id: self._select(item_id))
         row.bind("<MouseWheel>", self._on_rows_mousewheel)
 
-        selection_bar = tk.Frame(row, width=3, bg=base_bg)
+        selection_bar = tk.Frame(row, width=4, bg=base_bg)
         selection_bar.place(x=0, y=0, relheight=1)
 
         visibility_text = self._visibility_text(entry, parent)
         if visibility_text == VISIBLE_TEXT:
             visibility_color = COLOR_SUCCESS
+            visibility_bg = COLOR_SUCCESS_SOFT
             visibility_symbol = "●"
         elif visibility_text == PARENT_HIDDEN_TEXT:
             visibility_color = COLOR_WARNING
+            visibility_bg = COLOR_WARNING_SOFT
             visibility_symbol = "○"
         else:
             visibility_color = COLOR_TEXT_MUTED
+            visibility_bg = COLOR_HEADER
             visibility_symbol = "○"
 
         vis_label = tk.Label(
@@ -904,9 +947,11 @@ class ScheduleApp:
             width=8,
             cursor="hand2",
             anchor="w",
-            bg=base_bg,
+            bg=visibility_bg,
             fg=visibility_color,
             font=self.small_font,
+            padx=4,
+            pady=2,
         )
         vis_label.grid(row=0, column=0, sticky="w", padx=(12, 8), pady=4)
         vis_label.bind("<Button-1>", lambda _event, item_id=entry_id: self._toggle_visibility(item_id))
@@ -976,7 +1021,7 @@ class ScheduleApp:
         progress_label = tk.Label(
             progress_frame,
             text=progress_text(entry),
-            anchor="w",
+            anchor="e",
             bg=base_bg,
             fg=COLOR_TEXT,
             font=self.small_font,
@@ -988,7 +1033,7 @@ class ScheduleApp:
         progress_canvas = tk.Canvas(
             progress_frame,
             width=1,
-            height=5,
+            height=7,
             bg=base_bg,
             highlightthickness=0,
         )
@@ -1070,10 +1115,28 @@ class ScheduleApp:
         if width <= 2:
             return
         ratio = progress_ratio(location.entry)
-        canvas.create_rectangle(0, 1, width, 4, fill=COLOR_BORDER_SOFT, outline="")
+        create_rounded_rectangle(
+            canvas,
+            0,
+            1,
+            width,
+            6,
+            3,
+            fill=COLOR_BORDER_SOFT,
+            outline="",
+        )
         fill = COLOR_PARENT_COMPLETE if location.entry["kind"] == "parent" else COLOR_CHILD_COMPLETE
         if ratio > 0:
-            canvas.create_rectangle(0, 1, width * ratio, 4, fill=fill, outline="")
+            create_rounded_rectangle(
+                canvas,
+                0,
+                1,
+                width * ratio,
+                6,
+                3,
+                fill=fill,
+                outline="",
+            )
 
     # ----- selection -----
     def _select(self, entry_id: str) -> None:
@@ -1086,9 +1149,19 @@ class ScheduleApp:
         for widgets in self.row_widgets:
             is_selected = widgets.entry_id == self.selected_id
             bg = COLOR_PRIMARY_SOFT if is_selected else widgets.base_bg
+            location = self._find(widgets.entry_id)
+            visibility_bg = bg
+            if not is_selected and location is not None:
+                visibility_text = self._visibility_text(location.entry, location.parent)
+                if visibility_text == VISIBLE_TEXT:
+                    visibility_bg = COLOR_SUCCESS_SOFT
+                elif visibility_text == PARENT_HIDDEN_TEXT:
+                    visibility_bg = COLOR_WARNING_SOFT
+                else:
+                    visibility_bg = COLOR_HEADER
             widgets.container.configure(bg=bg)
             widgets.selection_bar.configure(bg=COLOR_PRIMARY if is_selected else bg)
-            widgets.visibility_label.configure(bg=bg)
+            widgets.visibility_label.configure(bg=visibility_bg)
             widgets.task_frame.configure(bg=bg)
             widgets.tree_indicator.configure(bg=bg)
             widgets.task_label.configure(bg=bg)
@@ -1659,9 +1732,17 @@ class ScheduleApp:
             if location is None:
                 continue
             days = self._delay_days(location.entry)
+            is_selected = widgets.entry_id == self.selected_id
             widgets.delay_label.configure(
-                text=f"{days}日" if days else "—",
+                text=f"{days}日遅延" if days else "—",
                 fg=COLOR_DANGER if days else COLOR_TEXT_MUTED,
+                bg=(
+                    COLOR_PRIMARY_SOFT
+                    if is_selected
+                    else COLOR_DANGER_SOFT if days else widgets.base_bg
+                ),
+                padx=4 if days else 0,
+                pady=2 if days else 0,
             )
 
     def _redraw_all_gantt(self) -> None:
