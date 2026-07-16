@@ -1,6 +1,6 @@
-# sch_gantt
+# [Schedule-board](https://github.com/taiyakisun/Schedule-board)
 
-親子グループ、進捗、遅延表示、Excel出力に対応した簡易ガントチャートアプリです。
+Schedule-boardは、親子グループ、進捗、遅延表示、Excel出力に対応した簡易ガントチャートアプリです。
 
 Python標準のTkinter/ttkを使い、落ち着いたニュートラル配色、状態バッジ、選択ストライプ、進捗ミニバー、週末と今日を見分けやすい時間軸を備えたモダンUIにしています。
 

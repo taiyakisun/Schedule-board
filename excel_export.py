@@ -719,8 +719,8 @@ def _core_properties_xml(reference_date: date) -> bytes:
             "xmlns:xsi": XSI_NS,
         },
     )
-    ET.SubElement(root, "dc:creator").text = "sch_gantt"
-    ET.SubElement(root, "cp:lastModifiedBy").text = "sch_gantt"
+    ET.SubElement(root, "dc:creator").text = "Schedule-board"
+    ET.SubElement(root, "cp:lastModifiedBy").text = "Schedule-board"
     timestamp = f"{reference_date.isoformat()}T00:00:00Z"
     ET.SubElement(root, "dcterms:created", {"xsi:type": "dcterms:W3CDTF"}).text = timestamp
     ET.SubElement(root, "dcterms:modified", {"xsi:type": "dcterms:W3CDTF"}).text = timestamp
@@ -729,7 +729,7 @@ def _core_properties_xml(reference_date: date) -> bytes:
 
 def _app_properties_xml() -> bytes:
     root = ET.Element("Properties", {"xmlns": EXTENDED_NS, "xmlns:vt": VT_NS})
-    ET.SubElement(root, "Application").text = "sch_gantt"
+    ET.SubElement(root, "Application").text = "Schedule-board"
     ET.SubElement(root, "AppVersion").text = "1.0"
     return _xml_bytes(root)
 

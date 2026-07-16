@@ -37,7 +37,7 @@ def resource_path(*parts: str) -> str:
 DATA_FILE = os.path.join(application_directory(), "schedules.json")
 COMPLETE_LOG_FILE = os.path.join(application_directory(), "completed_tasks.jsonl")
 
-TITLE_APP = "Schedule Board（ガントチャート）"
+TITLE_APP = "Schedule-board（ガントチャート）"
 LABEL_VISIBILITY = "表示"
 LABEL_TASK = "タスク"
 LABEL_PROGRESS = "進捗度"
@@ -836,7 +836,7 @@ class ScheduleApp:
         ).grid(row=0, column=0, sticky="w", pady=(0, 3))
         tk.Label(
             brand_frame,
-            text="Schedule Board",
+            text="Schedule-board",
             bg=COLOR_SURFACE,
             fg=COLOR_TEXT,
             font=self.title_font,
