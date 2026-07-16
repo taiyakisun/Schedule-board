@@ -10,6 +10,26 @@ Python標準のTkinter/ttkを使い、落ち着いたニュートラル配色、
 - 実行: `python sch_gantt_main.py`
 - 外部Pythonパッケージは不要です。
 
+## アイコン
+
+- `assets/sch_gantt_icon.png`: ホームページなどでも使える1024×1024のマスター画像
+- `assets/sch_gantt_icon.ico`: WindowsのタイトルバーとEXE用のマルチサイズアイコン
+
+通常起動ではウィンドウ左上とタスクバーに同じアイコンを設定します。
+
+## Windows EXEの作成
+
+ビルド時のみPyInstallerが必要です。
+
+```powershell
+python -m pip install pyinstaller
+.\build_exe.ps1
+```
+
+完成したアプリは `dist\ScheduleBoard\ScheduleBoard.exe` です。ビルドスクリプトはEXEへのICO埋め込みと、実行時にTkinterが読むPNG/ICOの同梱を行います。
+
+EXE版の `schedules.json` と `completed_tasks.jsonl` は、再起動後も保持されるようEXEと同じフォルダーに保存します。アプリのフォルダーには書込み権限が必要です。
+
 ## 主な機能
 
 - 「親を追加」「子を追加」による親子スケジュール管理

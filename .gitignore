@@ -41,4 +41,5 @@ completed_tasks.jsonl.recovery.tmp
 completed_tasks.jsonl.pending
 completed_tasks.jsonl.pending.tmp
 outputs/
+tmp/
 ~$*.xlsx

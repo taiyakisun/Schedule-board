@@ -1,13 +1,62 @@
 import json
+import os
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 import zipfile
 
 import sch_gantt_main as app_module
 from schedule_model import KIND_CHILD, KIND_PARENT, new_entry, progress_ratio, progress_text
+
+
+class ApplicationResourceTests(unittest.TestCase):
+    def test_application_directory_uses_executable_when_frozen(self) -> None:
+        executable = os.path.join("C:\\", "apps", "ScheduleBoard", "ScheduleBoard.exe")
+        with (
+            patch.object(app_module.sys, "frozen", True, create=True),
+            patch.object(app_module.sys, "executable", executable),
+        ):
+            self.assertEqual(
+                app_module.application_directory(),
+                os.path.dirname(executable),
+            )
+
+    def test_resource_path_uses_pyinstaller_bundle_directory(self) -> None:
+        bundle_dir = os.path.join("C:\\", "bundle")
+        with patch.object(app_module.sys, "_MEIPASS", bundle_dir, create=True):
+            self.assertEqual(
+                app_module.resource_path("assets", "sch_gantt_icon.png"),
+                os.path.join(bundle_dir, "assets", "sch_gantt_icon.png"),
+            )
+
+    def test_configure_application_icon_sets_png_and_windows_ico(self) -> None:
+        root = Mock()
+        icon_image = Mock()
+        with (
+            patch.object(app_module.tk, "PhotoImage", return_value=icon_image),
+            patch.object(app_module, "resource_path", side_effect=lambda *parts: os.path.join(*parts)),
+            patch.object(app_module.os, "name", "nt"),
+        ):
+            app_module.configure_application_icon(root)
+
+        self.assertEqual(
+            root.iconphoto.call_args_list,
+            [
+                call(False, icon_image),
+                call(True, icon_image),
+            ],
+        )
+        icon_path = os.path.join("assets", "sch_gantt_icon.ico")
+        self.assertEqual(
+            root.iconbitmap.call_args_list,
+            [
+                call(icon_path),
+                call(default=icon_path),
+            ],
+        )
+        self.assertIs(root._sch_gantt_icon_image, icon_image)
 
 
 class ScheduleAppLogicTests(unittest.TestCase):

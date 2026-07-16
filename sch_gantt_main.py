@@ -2,6 +2,7 @@ import copy
 import json
 import math
 import os
+import sys
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 import tkinter as tk
@@ -22,8 +23,19 @@ from schedule_model import (
 )
 
 
-DATA_FILE = os.path.join(os.path.dirname(__file__), "schedules.json")
-COMPLETE_LOG_FILE = os.path.join(os.path.dirname(__file__), "completed_tasks.jsonl")
+def application_directory() -> str:
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def resource_path(*parts: str) -> str:
+    base_path = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base_path, *parts)
+
+
+DATA_FILE = os.path.join(application_directory(), "schedules.json")
+COMPLETE_LOG_FILE = os.path.join(application_directory(), "completed_tasks.jsonl")
 
 TITLE_APP = "Schedule Board（ガントチャート）"
 LABEL_VISIBILITY = "表示"
@@ -141,6 +153,24 @@ COLOR_WEEKEND = "#F7F6F3"
 COLOR_SELECTED_WEEKEND = "#EFEEFA"
 TODAY_HIGHLIGHT_BG = "#FFF0EE"
 TODAY_LINE_COLOR = "#E5484D"
+
+
+def configure_application_icon(root: tk.Tk) -> None:
+    try:
+        icon_image = tk.PhotoImage(file=resource_path("assets", "sch_gantt_icon.png"))
+        root.iconphoto(False, icon_image)
+        root.iconphoto(True, icon_image)
+        root._sch_gantt_icon_image = icon_image
+    except (OSError, tk.TclError):
+        pass
+
+    if os.name == "nt":
+        try:
+            icon_path = resource_path("assets", "sch_gantt_icon.ico")
+            root.iconbitmap(icon_path)
+            root.iconbitmap(default=icon_path)
+        except (OSError, tk.TclError):
+            pass
 
 
 def today_in_jst() -> date:
@@ -2286,6 +2316,7 @@ class ScheduleApp:
 
 def main() -> None:
     root = tk.Tk()
+    configure_application_icon(root)
     ScheduleApp(root)
     root.mainloop()
 
