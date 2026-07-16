@@ -18,6 +18,8 @@ class ScheduleAppLogicTests(unittest.TestCase):
         app.selected_id = None
         app.current_jst_date = app_module.date(2026, 7, 15)
         app.row_widgets = []
+        app.header_font = Mock()
+        app.small_font = Mock()
         app._rebuild_rows = Mock()
         return app
 
@@ -222,7 +224,9 @@ class ScheduleAppLogicTests(unittest.TestCase):
 
         app._refresh_delay_labels()
 
-        delay_label.configure.assert_called_once_with(text="1日", fg="#c62828")
+        delay_label.configure.assert_called_once_with(
+            text="1日", fg=app_module.COLOR_DANGER
+        )
 
     def test_delete_rolls_back_when_schedule_save_fails(self) -> None:
         parent, _child_a, _child_b = self.make_hierarchy()
@@ -307,6 +311,24 @@ class ScheduleAppLogicTests(unittest.TestCase):
 
         app._redraw_scale()
 
+        app._redraw_all_gantt.assert_called_once_with()
+
+    def test_extreme_date_scale_limits_canvas_items_to_visible_resolution(self) -> None:
+        app = self.make_app()
+        app.scale_canvas = Mock()
+        app.scale_canvas.winfo_width.return_value = 1360
+        app.scale_canvas.winfo_height.return_value = 58
+        app.scale_canvas.create_text.return_value = 1
+        app.scale_canvas.bbox.return_value = None
+        app.today_label_screen_x = None
+        app.current_jst_date = app_module.date(2026, 7, 15)
+        app._visible_range = Mock(return_value=(app_module.date.min, app_module.date.max))
+        app._redraw_all_gantt = Mock()
+
+        app._redraw_scale()
+
+        self.assertLess(app.scale_canvas.create_line.call_count, 200)
+        self.assertLess(app.scale_canvas.create_text.call_count, 200)
         app._redraw_all_gantt.assert_called_once_with()
 
     def test_task_frame_height_is_kept_when_size_propagation_is_disabled(self) -> None:

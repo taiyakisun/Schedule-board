@@ -5,7 +5,7 @@ import os
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 import tkinter as tk
-from tkinter import filedialog, font as tkfont, messagebox
+from tkinter import filedialog, font as tkfont, messagebox, ttk
 
 from excel_export import export_to_excel
 from schedule_model import (
@@ -25,7 +25,7 @@ from schedule_model import (
 DATA_FILE = os.path.join(os.path.dirname(__file__), "schedules.json")
 COMPLETE_LOG_FILE = os.path.join(os.path.dirname(__file__), "completed_tasks.jsonl")
 
-TITLE_APP = "シンプル・スケジュール（ガント）"
+TITLE_APP = "Schedule Board（ガントチャート）"
 LABEL_VISIBILITY = "表示"
 LABEL_TASK = "タスク"
 LABEL_PROGRESS = "進捗度"
@@ -50,7 +50,8 @@ TEXT_CHILD = "子"
 TEXT_PERCENT_MODE = "0～100%"
 TEXT_VALUE_MODE = "指定数値"
 COMPLETE_BUTTON_WIDTH = 8
-ROW_CONTENT_MIN_HEIGHT = 30
+ROW_CONTENT_MIN_HEIGHT = 40
+VISIBILITY_COLUMN_WIDTH = 82
 PROGRESS_COLUMN_MIN_WIDTH = 78
 PROGRESS_COLUMN_MAX_WIDTH = 220
 PROGRESS_COLUMN_PADDING = 16
@@ -107,8 +108,33 @@ LOG_FIELD_PROGRESS_TOTAL = "進捗分母"
 
 JST = timezone(timedelta(hours=9))
 JST_MONITOR_MS = 30_000
-TODAY_HIGHLIGHT_BG = "#ffb8b8"
-TODAY_LINE_COLOR = "#ff0000"
+
+COLOR_APP_BG = "#F4F7FB"
+COLOR_SURFACE = "#FFFFFF"
+COLOR_SURFACE_ALT = "#F8FAFC"
+COLOR_HEADER = "#E8EEF7"
+COLOR_TEXT = "#1F2937"
+COLOR_TEXT_MUTED = "#64748B"
+COLOR_BORDER = "#CBD5E1"
+COLOR_BORDER_SOFT = "#E2E8F0"
+COLOR_PRIMARY = "#2563EB"
+COLOR_PRIMARY_HOVER = "#1D4ED8"
+COLOR_PRIMARY_SOFT = "#DBEAFE"
+COLOR_SELECTED_GANTT = "#EFF6FF"
+COLOR_DANGER = "#DC2626"
+COLOR_DANGER_HOVER = "#B91C1C"
+COLOR_DANGER_SOFT = "#FEE2E2"
+COLOR_SUCCESS = "#16A34A"
+COLOR_SUCCESS_HOVER = "#15803D"
+COLOR_SUCCESS_SOFT = "#DCFCE7"
+COLOR_WARNING = "#D97706"
+COLOR_WARNING_SOFT = "#FEF3C7"
+COLOR_PARENT_REMAINING = "#93C5FD"
+COLOR_PARENT_COMPLETE = "#2563EB"
+COLOR_CHILD_REMAINING = "#BBF7D0"
+COLOR_CHILD_COMPLETE = "#16A34A"
+TODAY_HIGHLIGHT_BG = "#FEE2E2"
+TODAY_LINE_COLOR = "#EF4444"
 
 
 def today_in_jst() -> date:
@@ -138,23 +164,72 @@ def number_text(value: float | int) -> str:
     return repr(numeric)
 
 
+def create_rounded_rectangle(
+    canvas: tk.Canvas,
+    x0: float,
+    y0: float,
+    x1: float,
+    y1: float,
+    radius: float,
+    **options,
+) -> int:
+    radius = max(0, min(radius, (x1 - x0) / 2, (y1 - y0) / 2))
+    points = (
+        x0 + radius,
+        y0,
+        x1 - radius,
+        y0,
+        x1,
+        y0,
+        x1,
+        y0 + radius,
+        x1,
+        y1 - radius,
+        x1,
+        y1,
+        x1 - radius,
+        y1,
+        x0 + radius,
+        y1,
+        x0,
+        y1,
+        x0,
+        y1 - radius,
+        x0,
+        y0 + radius,
+        x0,
+        y0,
+    )
+    return canvas.create_polygon(points, smooth=True, splinesteps=12, **options)
+
+
 @dataclass
 class RowWidgets:
     entry_id: str
     container: tk.Frame
+    selection_bar: tk.Frame
     visibility_label: tk.Label
     task_frame: tk.Frame
+    tree_indicator: tk.Label
     task_label: tk.Label
+    progress_frame: tk.Frame
     progress_label: tk.Label
+    progress_canvas: tk.Canvas
     delay_label: tk.Label
+    complete_button: ttk.Button
     gantt_canvas: tk.Canvas
+    base_bg: str
 
 
 class ScheduleApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title(TITLE_APP)
-        self.root.minsize(980, 420)
+        self.root.configure(bg=COLOR_APP_BG)
+        self.root.minsize(1050, 560)
+        initial_width = min(1360, max(1050, self.root.winfo_screenwidth() - 120))
+        initial_height = min(760, max(560, self.root.winfo_screenheight() - 160))
+        self.root.geometry(f"{initial_width}x{initial_height}")
 
         self.schedule: dict = {"version": 2, "parents": []}
         self.entries: list[dict] = self.schedule["parents"]
@@ -163,14 +238,26 @@ class ScheduleApp:
         self.selected_id: str | None = None
 
         self.task_font = tkfont.nametofont("TkDefaultFont")
+        self.task_font.configure(size=10)
         self.parent_font = self.task_font.copy()
         self.parent_font.configure(weight="bold")
+        self.title_font = self.task_font.copy()
+        self.title_font.configure(size=18, weight="bold")
+        self.subtitle_font = self.task_font.copy()
+        self.subtitle_font.configure(size=9)
+        self.header_font = self.task_font.copy()
+        self.header_font.configure(size=9, weight="bold")
+        self.button_font = self.task_font.copy()
+        self.button_font.configure(size=9, weight="bold")
+        self.small_font = self.task_font.copy()
+        self.small_font.configure(size=8)
+        self._configure_theme()
         self.row_content_height = max(
             ROW_CONTENT_MIN_HEIGHT,
             self.task_font.metrics("linespace") + 8,
             self.parent_font.metrics("linespace") + 8,
         )
-        self.task_column_width = 280
+        self.task_column_width = 320
         self.progress_column_width = PROGRESS_COLUMN_MIN_WIDTH
         self.delay_column_width = 76
         self.complete_column_width = self._measure_complete_button_width()
@@ -188,10 +275,118 @@ class ScheduleApp:
         self.root.after(100, self._redraw_all_gantt)
         self.root.after(JST_MONITOR_MS, self._monitor_jst_date)
 
+    def _configure_theme(self) -> None:
+        self.root.option_add("*Font", self.task_font)
+        self.style = ttk.Style(self.root)
+        if "clam" in self.style.theme_names():
+            self.style.theme_use("clam")
+
+        self.style.configure(
+            ".",
+            background=COLOR_APP_BG,
+            foreground=COLOR_TEXT,
+            font=self.task_font,
+        )
+        self.style.configure(
+            "Primary.TButton",
+            background=COLOR_PRIMARY,
+            foreground="white",
+            borderwidth=0,
+            focusthickness=0,
+            padding=(14, 8),
+            font=self.button_font,
+        )
+        self.style.map(
+            "Primary.TButton",
+            background=[("pressed", COLOR_PRIMARY_HOVER), ("active", COLOR_PRIMARY_HOVER)],
+        )
+        self.style.configure(
+            "Secondary.TButton",
+            background=COLOR_SURFACE,
+            foreground=COLOR_TEXT,
+            bordercolor=COLOR_BORDER,
+            lightcolor=COLOR_BORDER,
+            darkcolor=COLOR_BORDER,
+            borderwidth=1,
+            focusthickness=0,
+            padding=(12, 7),
+            font=self.button_font,
+        )
+        self.style.map(
+            "Secondary.TButton",
+            background=[("pressed", COLOR_HEADER), ("active", COLOR_SURFACE_ALT)],
+        )
+        self.style.configure(
+            "Danger.TButton",
+            background=COLOR_DANGER_SOFT,
+            foreground=COLOR_DANGER,
+            bordercolor=COLOR_DANGER_SOFT,
+            lightcolor=COLOR_DANGER_SOFT,
+            darkcolor=COLOR_DANGER_SOFT,
+            borderwidth=1,
+            focusthickness=0,
+            padding=(12, 7),
+            font=self.button_font,
+        )
+        self.style.map(
+            "Danger.TButton",
+            background=[("pressed", "#FECACA"), ("active", "#FECACA")],
+            foreground=[("pressed", COLOR_DANGER_HOVER), ("active", COLOR_DANGER_HOVER)],
+        )
+        self.style.configure(
+            "Success.TButton",
+            background=COLOR_SUCCESS_SOFT,
+            foreground=COLOR_SUCCESS,
+            bordercolor=COLOR_SUCCESS_SOFT,
+            lightcolor=COLOR_SUCCESS_SOFT,
+            darkcolor=COLOR_SUCCESS_SOFT,
+            borderwidth=1,
+            focusthickness=0,
+            padding=(10, 5),
+            font=self.button_font,
+        )
+        self.style.map(
+            "Success.TButton",
+            background=[("pressed", "#BBF7D0"), ("active", "#BBF7D0")],
+            foreground=[("pressed", COLOR_SUCCESS_HOVER), ("active", COLOR_SUCCESS_HOVER)],
+        )
+        self.style.configure(
+            "Modern.TEntry",
+            fieldbackground=COLOR_SURFACE,
+            foreground=COLOR_TEXT,
+            bordercolor=COLOR_BORDER,
+            lightcolor=COLOR_BORDER,
+            darkcolor=COLOR_BORDER,
+            insertcolor=COLOR_TEXT,
+            padding=7,
+        )
+        self.style.configure(
+            "Modern.TRadiobutton",
+            background=COLOR_SURFACE,
+            foreground=COLOR_TEXT,
+            padding=(0, 4),
+        )
+        self.style.map(
+            "Modern.TRadiobutton",
+            background=[("active", COLOR_SURFACE)],
+        )
+        self.style.configure(
+            "Modern.Vertical.TScrollbar",
+            background=COLOR_BORDER,
+            troughcolor=COLOR_SURFACE_ALT,
+            bordercolor=COLOR_SURFACE_ALT,
+            lightcolor=COLOR_BORDER,
+            darkcolor=COLOR_BORDER,
+            arrowcolor=COLOR_TEXT_MUTED,
+            borderwidth=0,
+        )
+
     def _monitor_jst_date(self) -> None:
         latest = today_in_jst()
         if latest != self.current_jst_date:
             self.current_jst_date = latest
+            if hasattr(self, "today_label"):
+                self.today_label.configure(text=latest.strftime("%Y年%m月%d日"))
             self._refresh_delay_labels()
             self._redraw_scale()
             self._redraw_all_gantt()
@@ -364,70 +559,189 @@ class ScheduleApp:
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(2, weight=1)
 
-        button_frame = tk.Frame(self.root)
-        button_frame.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
-        buttons = (
-            (TEXT_ADD_PARENT, self._on_add_parent),
-            (TEXT_ADD_CHILD, self._on_add_child),
-            (TEXT_DELETE, self._on_delete),
-            (TEXT_UP, self._on_up),
-            (TEXT_DOWN, self._on_down),
-            (TEXT_EXPORT_EXCEL, self._on_export_excel),
-            (TEXT_RELOAD_INCOMPLETE, self._on_reload_incomplete_tasks),
+        topbar = tk.Frame(
+            self.root,
+            bg=COLOR_SURFACE,
+            highlightthickness=1,
+            highlightbackground=COLOR_BORDER_SOFT,
         )
-        for column, (text, command) in enumerate(buttons):
-            padding = (0, 6) if column < len(buttons) - 1 else 0
-            tk.Button(button_frame, text=text, command=command).grid(row=0, column=column, padx=padding)
+        topbar.grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 10))
+        topbar.columnconfigure(0, weight=1)
 
-        self.header = tk.Frame(self.root)
-        self.header.grid(row=1, column=0, sticky="ew", padx=(9, 9))
+        brand_frame = tk.Frame(topbar, bg=COLOR_SURFACE)
+        brand_frame.grid(row=0, column=0, sticky="w", padx=20, pady=(16, 8))
+        tk.Label(
+            brand_frame,
+            text="Schedule Board",
+            bg=COLOR_SURFACE,
+            fg=COLOR_TEXT,
+            font=self.title_font,
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w")
+        tk.Label(
+            brand_frame,
+            text="タスクと進捗を、ひとつのタイムラインで管理",
+            bg=COLOR_SURFACE,
+            fg=COLOR_TEXT_MUTED,
+            font=self.subtitle_font,
+            anchor="w",
+        ).grid(row=1, column=0, sticky="w", pady=(2, 0))
+
+        overview_frame = tk.Frame(topbar, bg=COLOR_SURFACE)
+        overview_frame.grid(row=0, column=1, sticky="e", padx=20, pady=(16, 8))
+        self.summary_label = tk.Label(
+            overview_frame,
+            text="0グループ  •  0タスク",
+            bg=COLOR_SURFACE,
+            fg=COLOR_TEXT,
+            font=self.header_font,
+            anchor="e",
+        )
+        self.summary_label.grid(row=0, column=0, sticky="e")
+        self.today_label = tk.Label(
+            overview_frame,
+            text=self.current_jst_date.strftime("%Y年%m月%d日"),
+            bg=COLOR_SURFACE,
+            fg=COLOR_TEXT_MUTED,
+            font=self.small_font,
+            anchor="e",
+        )
+        self.today_label.grid(row=1, column=0, sticky="e", pady=(3, 0))
+
+        button_frame = tk.Frame(topbar, bg=COLOR_SURFACE)
+        button_frame.grid(row=1, column=0, columnspan=2, sticky="ew", padx=20, pady=(4, 16))
+        button_frame.columnconfigure(6, weight=1)
+        self.toolbar_buttons: dict[str, ttk.Button] = {}
+
+        button_specs = (
+            (0, TEXT_ADD_PARENT, "＋ 親を追加", self._on_add_parent, "Primary.TButton"),
+            (1, TEXT_ADD_CHILD, "＋ 子を追加", self._on_add_child, "Secondary.TButton"),
+            (3, TEXT_UP, "↑ 上へ", self._on_up, "Secondary.TButton"),
+            (4, TEXT_DOWN, "↓ 下へ", self._on_down, "Secondary.TButton"),
+            (5, TEXT_DELETE, "削除", self._on_delete, "Danger.TButton"),
+            (7, TEXT_EXPORT_EXCEL, "Excel出力", self._on_export_excel, "Secondary.TButton"),
+            (
+                8,
+                TEXT_RELOAD_INCOMPLETE,
+                "↻ 未完了タスクを再読込",
+                self._on_reload_incomplete_tasks,
+                "Secondary.TButton",
+            ),
+        )
+        ttk.Separator(button_frame, orient="vertical").grid(
+            row=0, column=2, sticky="ns", padx=10, pady=2
+        )
+        for column, key, text, command, style_name in button_specs:
+            button = ttk.Button(
+                button_frame,
+                text=text,
+                command=command,
+                style=style_name,
+                cursor="hand2",
+            )
+            button.grid(row=0, column=column, sticky="w", padx=(0, 7))
+            self.toolbar_buttons[key] = button
+
+        self.header = tk.Frame(
+            self.root,
+            bg=COLOR_HEADER,
+            highlightthickness=1,
+            highlightbackground=COLOR_BORDER_SOFT,
+        )
+        self.header.grid(row=1, column=0, sticky="ew", padx=(16, 16))
         for column in range(7):
             self.header.columnconfigure(column, weight=1 if column == 6 else 0)
 
-        tk.Label(self.header, text=LABEL_VISIBILITY, width=8, anchor="w").grid(
-            row=0, column=0, sticky="w", padx=(4, 8)
+        self.header_labels: dict[str, tk.Label] = {}
+        header_specs = (
+            (0, LABEL_VISIBILITY, 8, (12, 8)),
+            (1, LABEL_TASK, None, (0, 8)),
+            (2, LABEL_PROGRESS, None, (0, 8)),
+            (3, LABEL_DELAY, None, (0, 8)),
+            (4, LABEL_COMPLETE, None, (0, 8)),
+            (6, LABEL_GANTT, None, (8, 8)),
         )
-        self.task_header_label = tk.Label(self.header, text=LABEL_TASK, anchor="w")
-        self.task_header_label.grid(row=0, column=1, sticky="ew", padx=(0, 8))
-        tk.Label(self.header, text=LABEL_PROGRESS, anchor="w").grid(row=0, column=2, sticky="w", padx=(0, 8))
-        tk.Label(self.header, text=LABEL_DELAY, anchor="w").grid(row=0, column=3, sticky="w", padx=(0, 8))
-        tk.Label(self.header, text=LABEL_COMPLETE, anchor="w").grid(row=0, column=4, sticky="w", padx=(0, 8))
-        tk.Label(self.header, text=LABEL_GANTT, anchor="w").grid(row=0, column=6, sticky="w")
+        for column, text, width, padding in header_specs:
+            label = tk.Label(
+                self.header,
+                text=text,
+                width=width,
+                anchor="w",
+                bg=COLOR_HEADER,
+                fg=COLOR_TEXT_MUTED,
+                font=self.header_font,
+            )
+            label.grid(
+                row=0,
+                column=column,
+                rowspan=1 if column == 6 else 2,
+                sticky="nsew",
+                padx=padding,
+                pady=(10, 6),
+            )
+            self.header_labels[text] = label
+        self.task_header_label = self.header_labels[LABEL_TASK]
 
-        self.scale_canvas = tk.Canvas(self.header, height=54, highlightthickness=0, background=self.root.cget("bg"))
-        self.scale_canvas.grid(row=1, column=6, sticky="ew", pady=(2, 0), padx=(0, 4))
+        self.scale_canvas = tk.Canvas(
+            self.header,
+            height=58,
+            highlightthickness=0,
+            background=COLOR_SURFACE,
+        )
+        self.scale_canvas.grid(row=1, column=6, sticky="ew", padx=(0, 4))
         self.scale_canvas.bind("<Configure>", lambda _event: self._redraw_scale())
 
         self.splitter = tk.Frame(
             self.header,
             width=self.splitter_width,
             cursor="sb_h_double_arrow",
-            bg="#d0d0d0",
+            bg=COLOR_BORDER,
         )
         self.splitter.grid(row=0, column=5, rowspan=2, sticky="ns")
         self.splitter.bind("<Button-1>", self._on_splitter_press)
         self.splitter.bind("<B1-Motion>", self._on_splitter_drag)
         self.splitter.bind("<ButtonRelease-1>", self._on_splitter_release)
 
-        rows_shell = tk.Frame(self.root, bd=1, relief="sunken")
-        rows_shell.grid(row=2, column=0, sticky="nsew", padx=8, pady=(4, 8))
+        rows_shell = tk.Frame(
+            self.root,
+            bg=COLOR_SURFACE,
+            highlightthickness=1,
+            highlightbackground=COLOR_BORDER_SOFT,
+        )
+        rows_shell.grid(row=2, column=0, sticky="nsew", padx=16, pady=(0, 16))
         rows_shell.columnconfigure(0, weight=1)
         rows_shell.rowconfigure(0, weight=1)
 
-        self.rows_canvas = tk.Canvas(rows_shell, highlightthickness=0, background=self.root.cget("bg"))
+        self.rows_canvas = tk.Canvas(
+            rows_shell,
+            highlightthickness=0,
+            background=COLOR_SURFACE,
+        )
         self.rows_canvas.grid(row=0, column=0, sticky="nsew")
-        scrollbar = tk.Scrollbar(rows_shell, orient="vertical", command=self.rows_canvas.yview)
-        scrollbar.grid(row=0, column=1, sticky="ns")
-        self.rows_canvas.configure(yscrollcommand=scrollbar.set)
-        self.header.grid_configure(padx=(9, 9 + scrollbar.winfo_reqwidth()))
+        self.rows_scrollbar = ttk.Scrollbar(
+            rows_shell,
+            orient="vertical",
+            command=self.rows_canvas.yview,
+            style="Modern.Vertical.TScrollbar",
+        )
+        self.rows_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.rows_canvas.configure(yscrollcommand=self.rows_scrollbar.set)
+        self.header.grid_configure(padx=(16, 16 + self.rows_scrollbar.winfo_reqwidth()))
 
-        self.rows_container = tk.Frame(self.rows_canvas)
+        self.rows_container = tk.Frame(self.rows_canvas, bg=COLOR_SURFACE)
         self.rows_window = self.rows_canvas.create_window((0, 0), window=self.rows_container, anchor="nw")
         self.rows_container.columnconfigure(0, weight=1)
         self.rows_container.bind("<Configure>", self._on_rows_container_configure)
         self.rows_canvas.bind("<Configure>", self._on_rows_canvas_configure)
+        self.rows_canvas.bind("<MouseWheel>", self._on_rows_mousewheel)
+        self.rows_container.bind("<MouseWheel>", self._on_rows_mousewheel)
 
         self._apply_column_width()
+
+    def _on_rows_mousewheel(self, event: tk.Event) -> str:
+        if event.delta:
+            self.rows_canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+        return "break"
 
     def _on_rows_container_configure(self, _event: tk.Event) -> None:
         self.rows_canvas.configure(scrollregion=self.rows_canvas.bbox("all"))
@@ -438,12 +752,14 @@ class ScheduleApp:
         self._redraw_all_gantt()
 
     def _apply_column_width(self) -> None:
+        self.header.columnconfigure(0, minsize=VISIBILITY_COLUMN_WIDTH)
         self.header.columnconfigure(1, minsize=self.task_column_width + 8)
         self.header.columnconfigure(2, minsize=self.progress_column_width)
         self.header.columnconfigure(3, minsize=self.delay_column_width)
         self.header.columnconfigure(4, minsize=self.complete_column_width + 8)
         for widgets in self.row_widgets:
             row = widgets.container
+            row.columnconfigure(0, minsize=VISIBILITY_COLUMN_WIDTH)
             row.columnconfigure(1, minsize=self.task_column_width)
             row.columnconfigure(2, minsize=self.progress_column_width)
             row.columnconfigure(3, minsize=self.delay_column_width)
@@ -452,7 +768,12 @@ class ScheduleApp:
             widgets.task_frame.grid_propagate(False)
 
     def _measure_complete_button_width(self) -> int:
-        probe = tk.Button(self.root, text=TEXT_COMPLETE, width=COMPLETE_BUTTON_WIDTH)
+        probe = ttk.Button(
+            self.root,
+            text=f"✓ {TEXT_COMPLETE}",
+            width=COMPLETE_BUTTON_WIDTH,
+            style="Success.TButton",
+        )
         width = probe.winfo_reqwidth()
         probe.destroy()
         return width
@@ -495,51 +816,145 @@ class ScheduleApp:
     def _rebuild_rows(self) -> None:
         self._update_progress_column_width()
         self._clear_rows()
-        for row_index, (entry, parent) in enumerate(self._display_items()):
+        display_items = self._display_items()
+        for row_index, (entry, parent) in enumerate(display_items):
             self._add_row(row_index, entry, parent)
+        if not display_items:
+            self._show_empty_state()
+        self._update_summary_label()
         self._refresh_selection()
         self._apply_column_width()
         self._refresh_delay_labels()
         self._redraw_all_gantt()
         self._redraw_scale()
 
+    def _update_summary_label(self) -> None:
+        if not hasattr(self, "summary_label"):
+            return
+        parent_count = len(self.entries)
+        task_count = sum(1 for _entry in iter_all_entries(self.schedule))
+        self.summary_label.configure(
+            text=f"{parent_count}グループ  •  {task_count}タスク"
+        )
+
+    def _show_empty_state(self) -> None:
+        empty_frame = tk.Frame(self.rows_container, bg=COLOR_SURFACE, height=260)
+        empty_frame.grid(row=0, column=0, sticky="nsew")
+        empty_frame.grid_propagate(False)
+        empty_frame.columnconfigure(0, weight=1)
+        empty_frame.rowconfigure(0, weight=1)
+        content = tk.Frame(empty_frame, bg=COLOR_SURFACE)
+        content.grid(row=0, column=0)
+        tk.Label(
+            content,
+            text="＋",
+            bg=COLOR_PRIMARY_SOFT,
+            fg=COLOR_PRIMARY,
+            font=self.title_font,
+            width=3,
+            height=1,
+        ).grid(row=0, column=0, pady=(0, 12))
+        tk.Label(
+            content,
+            text="最初のスケジュールを追加しましょう",
+            bg=COLOR_SURFACE,
+            fg=COLOR_TEXT,
+            font=self.parent_font,
+        ).grid(row=1, column=0)
+        tk.Label(
+            content,
+            text="「親を追加」からプロジェクトや作業グループを作成できます。",
+            bg=COLOR_SURFACE,
+            fg=COLOR_TEXT_MUTED,
+            font=self.subtitle_font,
+        ).grid(row=2, column=0, pady=(6, 0))
+
     def _add_row(self, row_index: int, entry: dict, parent: dict) -> None:
         entry_id = entry["id"]
         is_child = entry["kind"] == "child"
-        row = tk.Frame(self.rows_container)
+        base_bg = COLOR_SURFACE_ALT if row_index % 2 else COLOR_SURFACE
+        row = tk.Frame(
+            self.rows_container,
+            bg=base_bg,
+            highlightthickness=0,
+        )
         row.grid(row=row_index, column=0, sticky="ew")
         for column in range(7):
             row.columnconfigure(column, weight=1 if column == 6 else 0)
         row.bind("<Button-1>", lambda _event, item_id=entry_id: self._select(item_id))
+        row.bind("<MouseWheel>", self._on_rows_mousewheel)
+
+        selection_bar = tk.Frame(row, width=3, bg=base_bg)
+        selection_bar.place(x=0, y=0, relheight=1)
+
+        visibility_text = self._visibility_text(entry, parent)
+        if visibility_text == VISIBLE_TEXT:
+            visibility_color = COLOR_SUCCESS
+            visibility_symbol = "●"
+        elif visibility_text == PARENT_HIDDEN_TEXT:
+            visibility_color = COLOR_WARNING
+            visibility_symbol = "○"
+        else:
+            visibility_color = COLOR_TEXT_MUTED
+            visibility_symbol = "○"
 
         vis_label = tk.Label(
             row,
-            text=self._visibility_text(entry, parent),
+            text=f"{visibility_symbol} {visibility_text}",
             width=8,
             cursor="hand2",
             anchor="w",
+            bg=base_bg,
+            fg=visibility_color,
+            font=self.small_font,
         )
-        vis_label.grid(row=0, column=0, sticky="w", padx=(4, 8), pady=2)
+        vis_label.grid(row=0, column=0, sticky="w", padx=(12, 8), pady=4)
         vis_label.bind("<Button-1>", lambda _event, item_id=entry_id: self._toggle_visibility(item_id))
+        vis_label.bind("<MouseWheel>", self._on_rows_mousewheel)
 
-        task_frame = tk.Frame(row, height=self.row_content_height)
-        task_frame.grid(row=0, column=1, sticky="nsew", padx=(0, 8), pady=2)
+        task_frame = tk.Frame(row, height=self.row_content_height, bg=base_bg)
+        task_frame.grid(row=0, column=1, sticky="nsew", padx=(0, 8), pady=4)
         task_frame.columnconfigure(1, weight=1)
         task_frame.grid_propagate(False)
         task_frame.bind("<Button-1>", lambda _event, item_id=entry_id: self._select(item_id))
+        task_frame.bind("<MouseWheel>", self._on_rows_mousewheel)
 
         if is_child:
-            tk.Label(task_frame, text="└", anchor="w").grid(row=0, column=0, sticky="w", padx=(24, 4))
-        else:
-            toggle = tk.Button(
+            children = parent.get("children", [])
+            branch = "└─" if children and children[-1]["id"] == entry_id else "├─"
+            tree_indicator = tk.Label(
                 task_frame,
-                text=TEXT_EXPAND if entry.get("collapsed", False) else TEXT_COLLAPSE,
-                width=2,
-                padx=0,
-                pady=0,
-                command=lambda item_id=entry_id: self._toggle_collapsed(item_id),
+                text=branch,
+                anchor="w",
+                bg=base_bg,
+                fg=COLOR_BORDER,
+                font=self.task_font,
             )
-            toggle.grid(row=0, column=0, sticky="w", padx=(0, 4))
+            tree_indicator.grid(row=0, column=0, sticky="w", padx=(22, 6))
+            tree_indicator.bind(
+                "<Button-1>", lambda _event, item_id=entry_id: self._select(item_id)
+            )
+        else:
+            has_children = bool(entry.get("children"))
+            tree_indicator = tk.Label(
+                task_frame,
+                text=(
+                    TEXT_EXPAND if entry.get("collapsed", False) else TEXT_COLLAPSE
+                ) if has_children else "•",
+                width=2,
+                anchor="center",
+                cursor="hand2" if has_children else "arrow",
+                bg=base_bg,
+                fg=COLOR_PRIMARY if has_children else COLOR_BORDER,
+                font=self.header_font,
+            )
+            tree_indicator.grid(row=0, column=0, sticky="w", padx=(0, 4))
+            if has_children:
+                tree_indicator.bind(
+                    "<Button-1>",
+                    lambda _event, item_id=entry_id: self._toggle_collapsed(item_id),
+                )
+        tree_indicator.bind("<MouseWheel>", self._on_rows_mousewheel)
 
         task_label = tk.Label(
             task_frame,
@@ -547,47 +962,118 @@ class ScheduleApp:
             anchor="w",
             justify="left",
             font=self.task_font if is_child else self.parent_font,
+            bg=base_bg,
+            fg=COLOR_TEXT,
         )
         task_label.grid(row=0, column=1, sticky="nsew")
         task_label.bind("<Button-1>", lambda _event, item_id=entry_id: self._select(item_id))
         task_label.bind("<Double-1>", lambda _event, item_id=entry_id: self._on_edit(item_id))
+        task_label.bind("<MouseWheel>", self._on_rows_mousewheel)
 
-        progress_label = tk.Label(row, text=progress_text(entry), anchor="w")
-        progress_label.grid(row=0, column=2, sticky="ew", padx=(0, 8), pady=2)
+        progress_frame = tk.Frame(row, bg=base_bg, height=self.row_content_height)
+        progress_frame.grid(row=0, column=2, sticky="nsew", padx=(0, 12), pady=4)
+        progress_frame.columnconfigure(0, weight=1)
+        progress_label = tk.Label(
+            progress_frame,
+            text=progress_text(entry),
+            anchor="w",
+            bg=base_bg,
+            fg=COLOR_TEXT,
+            font=self.small_font,
+        )
+        progress_label.grid(row=0, column=0, sticky="ew")
         progress_label.bind("<Button-1>", lambda _event, item_id=entry_id: self._select(item_id))
         progress_label.bind("<Double-1>", lambda _event, item_id=entry_id: self._on_edit(item_id))
+        progress_label.bind("<MouseWheel>", self._on_rows_mousewheel)
+        progress_canvas = tk.Canvas(
+            progress_frame,
+            width=1,
+            height=5,
+            bg=base_bg,
+            highlightthickness=0,
+        )
+        progress_canvas.grid(row=1, column=0, sticky="ew", pady=(3, 0))
+        progress_canvas.bind(
+            "<Configure>",
+            lambda _event, item_id=entry_id: self._draw_progress_indicator(item_id),
+        )
+        progress_canvas.bind(
+            "<Button-1>", lambda _event, item_id=entry_id: self._select(item_id)
+        )
+        progress_canvas.bind("<MouseWheel>", self._on_rows_mousewheel)
 
-        delay_label = tk.Label(row, anchor="w")
-        delay_label.grid(row=0, column=3, sticky="ew", padx=(0, 8), pady=2)
-        delay_label.bind("<Button-1>", lambda _event, item_id=entry_id: self._select(item_id))
-
-        complete_button = tk.Button(
+        delay_label = tk.Label(
             row,
-            text=TEXT_COMPLETE,
+            anchor="w",
+            bg=base_bg,
+            fg=COLOR_TEXT_MUTED,
+            font=self.small_font,
+        )
+        delay_label.grid(row=0, column=3, sticky="ew", padx=(0, 8), pady=4)
+        delay_label.bind("<Button-1>", lambda _event, item_id=entry_id: self._select(item_id))
+        delay_label.bind("<MouseWheel>", self._on_rows_mousewheel)
+
+        complete_button = ttk.Button(
+            row,
+            text=f"✓ {TEXT_COMPLETE}",
             width=COMPLETE_BUTTON_WIDTH,
+            style="Success.TButton",
+            cursor="hand2",
             command=lambda item_id=entry_id: self._on_complete(item_id),
         )
-        complete_button.grid(row=0, column=4, sticky="w", padx=(0, 8), pady=2)
+        complete_button.grid(row=0, column=4, sticky="w", padx=(0, 8), pady=4)
+        complete_button.bind("<MouseWheel>", self._on_rows_mousewheel)
 
-        tk.Frame(row, width=self.splitter_width, bg="#d0d0d0").grid(row=0, column=5, sticky="ns")
+        tk.Frame(row, width=self.splitter_width, bg=COLOR_BORDER).grid(
+            row=0, column=5, sticky="ns"
+        )
 
-        gantt_canvas = tk.Canvas(row, height=self.row_content_height, background="#ffffff", highlightthickness=0)
-        gantt_canvas.grid(row=0, column=6, sticky="ew", padx=(0, 4), pady=2)
+        gantt_canvas = tk.Canvas(
+            row,
+            height=self.row_content_height,
+            background=base_bg,
+            highlightthickness=0,
+        )
+        gantt_canvas.grid(row=0, column=6, sticky="ew", padx=(0, 4), pady=4)
         gantt_canvas.bind("<Button-1>", lambda _event, item_id=entry_id: self._select(item_id))
         gantt_canvas.bind("<Configure>", lambda _event, item_id=entry_id: self._redraw_gantt_for(item_id))
+        gantt_canvas.bind("<MouseWheel>", self._on_rows_mousewheel)
 
         self.row_widgets.append(
             RowWidgets(
                 entry_id,
                 row,
+                selection_bar,
                 vis_label,
                 task_frame,
+                tree_indicator,
                 task_label,
+                progress_frame,
                 progress_label,
+                progress_canvas,
                 delay_label,
+                complete_button,
                 gantt_canvas,
+                base_bg,
             )
         )
+        self.root.after_idle(lambda item_id=entry_id: self._draw_progress_indicator(item_id))
+
+    def _draw_progress_indicator(self, entry_id: str) -> None:
+        widgets = next((item for item in self.row_widgets if item.entry_id == entry_id), None)
+        location = self._find(entry_id)
+        if widgets is None or location is None:
+            return
+        canvas = widgets.progress_canvas
+        canvas.delete("all")
+        width = canvas.winfo_width()
+        if width <= 2:
+            return
+        ratio = progress_ratio(location.entry)
+        canvas.create_rectangle(0, 1, width, 4, fill=COLOR_BORDER_SOFT, outline="")
+        fill = COLOR_PARENT_COMPLETE if location.entry["kind"] == "parent" else COLOR_CHILD_COMPLETE
+        if ratio > 0:
+            canvas.create_rectangle(0, 1, width * ratio, 4, fill=fill, outline="")
 
     # ----- selection -----
     def _select(self, entry_id: str) -> None:
@@ -597,18 +1083,24 @@ class ScheduleApp:
         self._refresh_selection()
 
     def _refresh_selection(self) -> None:
-        default_bg = self.rows_container.cget("bg")
-        selected_bg = "#d9edf7"
         for widgets in self.row_widgets:
             is_selected = widgets.entry_id == self.selected_id
-            bg = selected_bg if is_selected else default_bg
+            bg = COLOR_PRIMARY_SOFT if is_selected else widgets.base_bg
             widgets.container.configure(bg=bg)
+            widgets.selection_bar.configure(bg=COLOR_PRIMARY if is_selected else bg)
             widgets.visibility_label.configure(bg=bg)
             widgets.task_frame.configure(bg=bg)
+            widgets.tree_indicator.configure(bg=bg)
             widgets.task_label.configure(bg=bg)
+            widgets.progress_frame.configure(bg=bg)
             widgets.progress_label.configure(bg=bg)
+            widgets.progress_canvas.configure(bg=bg)
             widgets.delay_label.configure(bg=bg)
-            widgets.gantt_canvas.configure(bg="#eef7fb" if is_selected else "#ffffff")
+            widgets.gantt_canvas.configure(
+                bg=COLOR_SELECTED_GANTT if is_selected else widgets.base_bg
+            )
+            self._draw_progress_indicator(widgets.entry_id)
+            self._redraw_gantt_for(widgets.entry_id)
 
     # ----- button actions -----
     def _on_add_parent(self) -> None:
@@ -815,19 +1307,37 @@ class ScheduleApp:
 
         dlg = tk.Toplevel(self.root)
         dlg.title(dialog_title)
+        dlg.configure(bg=COLOR_APP_BG)
+        dlg.transient(self.root)
         dlg.grab_set()
         dlg.resizable(False, False)
+        dlg.columnconfigure(0, weight=1)
 
-        labels = (
-            LABEL_TASK_NAME,
-            LABEL_START_DATE,
-            LABEL_END_DATE,
-            LABEL_PROGRESS_MODE,
-            LABEL_PROGRESS_VALUE,
-            LABEL_PROGRESS_TOTAL,
+        content = tk.Frame(
+            dlg,
+            bg=COLOR_SURFACE,
+            highlightthickness=1,
+            highlightbackground=COLOR_BORDER_SOFT,
         )
-        for row, label in enumerate(labels):
-            tk.Label(dlg, text=label).grid(row=row, column=0, sticky="e", padx=6, pady=(8, 4) if row == 0 else 4)
+        content.grid(row=0, column=0, sticky="nsew", padx=16, pady=16)
+        content.columnconfigure(0, weight=1)
+
+        tk.Label(
+            content,
+            text=dialog_title,
+            bg=COLOR_SURFACE,
+            fg=COLOR_TEXT,
+            font=self.title_font,
+            anchor="w",
+        ).grid(row=0, column=0, sticky="ew", padx=24, pady=(22, 2))
+        tk.Label(
+            content,
+            text="タスクの期間と進捗を入力してください。",
+            bg=COLOR_SURFACE,
+            fg=COLOR_TEXT_MUTED,
+            font=self.subtitle_font,
+            anchor="w",
+        ).grid(row=1, column=0, sticky="ew", padx=24, pady=(0, 18))
 
         task_var = tk.StringVar()
         start_var = tk.StringVar()
@@ -849,26 +1359,120 @@ class ScheduleApp:
             start_var.set(format_date(today))
             end_var.set(format_date(today))
 
-        task_entry = tk.Entry(dlg, textvariable=task_var, width=40)
-        start_entry = tk.Entry(dlg, textvariable=start_var, width=16)
-        end_entry = tk.Entry(dlg, textvariable=end_var, width=16)
-        task_entry.grid(row=0, column=1, sticky="w", padx=(0, 8), pady=(8, 4))
-        start_entry.grid(row=1, column=1, sticky="w", padx=(0, 8), pady=4)
-        end_entry.grid(row=2, column=1, sticky="w", padx=(0, 8), pady=4)
+        form = tk.Frame(content, bg=COLOR_SURFACE)
+        form.grid(row=2, column=0, sticky="ew", padx=24)
+        form.columnconfigure(0, weight=1)
 
-        mode_frame = tk.Frame(dlg)
-        mode_frame.grid(row=3, column=1, sticky="w", padx=(0, 8), pady=4)
-        tk.Radiobutton(mode_frame, text=TEXT_PERCENT_MODE, variable=progress_mode_var, value="percent").grid(
-            row=0, column=0, sticky="w"
+        tk.Label(
+            form,
+            text=LABEL_TASK_NAME,
+            bg=COLOR_SURFACE,
+            fg=COLOR_TEXT,
+            font=self.header_font,
+            anchor="w",
+        ).grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        task_entry = ttk.Entry(
+            form,
+            textvariable=task_var,
+            width=48,
+            style="Modern.TEntry",
         )
-        tk.Radiobutton(mode_frame, text=TEXT_VALUE_MODE, variable=progress_mode_var, value="value").grid(
-            row=0, column=1, sticky="w", padx=(10, 0)
-        )
+        task_entry.grid(row=1, column=0, sticky="ew", pady=(0, 16))
 
-        progress_value_entry = tk.Entry(dlg, textvariable=progress_value_var, width=16)
-        progress_total_entry = tk.Entry(dlg, textvariable=progress_total_var, width=16)
-        progress_value_entry.grid(row=4, column=1, sticky="w", padx=(0, 8), pady=4)
-        progress_total_entry.grid(row=5, column=1, sticky="w", padx=(0, 8), pady=4)
+        dates_frame = tk.Frame(form, bg=COLOR_SURFACE)
+        dates_frame.grid(row=2, column=0, sticky="ew", pady=(0, 16))
+        dates_frame.columnconfigure(0, weight=1)
+        dates_frame.columnconfigure(1, weight=1)
+        tk.Label(
+            dates_frame,
+            text=LABEL_START_DATE,
+            bg=COLOR_SURFACE,
+            fg=COLOR_TEXT,
+            font=self.header_font,
+            anchor="w",
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 8), pady=(0, 6))
+        tk.Label(
+            dates_frame,
+            text=LABEL_END_DATE,
+            bg=COLOR_SURFACE,
+            fg=COLOR_TEXT,
+            font=self.header_font,
+            anchor="w",
+        ).grid(row=0, column=1, sticky="ew", padx=(8, 0), pady=(0, 6))
+        start_entry = ttk.Entry(
+            dates_frame,
+            textvariable=start_var,
+            width=20,
+            style="Modern.TEntry",
+        )
+        end_entry = ttk.Entry(
+            dates_frame,
+            textvariable=end_var,
+            width=20,
+            style="Modern.TEntry",
+        )
+        start_entry.grid(row=1, column=0, sticky="ew", padx=(0, 8))
+        end_entry.grid(row=1, column=1, sticky="ew", padx=(8, 0))
+
+        tk.Label(
+            form,
+            text=LABEL_PROGRESS_MODE,
+            bg=COLOR_SURFACE,
+            fg=COLOR_TEXT,
+            font=self.header_font,
+            anchor="w",
+        ).grid(row=3, column=0, sticky="ew", pady=(0, 6))
+        mode_frame = tk.Frame(form, bg=COLOR_SURFACE)
+        mode_frame.grid(row=4, column=0, sticky="w", pady=(0, 14))
+        ttk.Radiobutton(
+            mode_frame,
+            text=TEXT_PERCENT_MODE,
+            variable=progress_mode_var,
+            value="percent",
+            style="Modern.TRadiobutton",
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Radiobutton(
+            mode_frame,
+            text=TEXT_VALUE_MODE,
+            variable=progress_mode_var,
+            value="value",
+            style="Modern.TRadiobutton",
+        ).grid(row=0, column=1, sticky="w", padx=(18, 0))
+
+        progress_frame = tk.Frame(form, bg=COLOR_SURFACE)
+        progress_frame.grid(row=5, column=0, sticky="ew", pady=(0, 4))
+        progress_frame.columnconfigure(0, weight=1)
+        progress_frame.columnconfigure(1, weight=1)
+        tk.Label(
+            progress_frame,
+            text=LABEL_PROGRESS_VALUE,
+            bg=COLOR_SURFACE,
+            fg=COLOR_TEXT,
+            font=self.header_font,
+            anchor="w",
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 8), pady=(0, 6))
+        tk.Label(
+            progress_frame,
+            text=LABEL_PROGRESS_TOTAL,
+            bg=COLOR_SURFACE,
+            fg=COLOR_TEXT,
+            font=self.header_font,
+            anchor="w",
+        ).grid(row=0, column=1, sticky="ew", padx=(8, 0), pady=(0, 6))
+        progress_value_entry = ttk.Entry(
+            progress_frame,
+            textvariable=progress_value_var,
+            width=20,
+            style="Modern.TEntry",
+        )
+        progress_total_entry = ttk.Entry(
+            progress_frame,
+            textvariable=progress_total_var,
+            width=20,
+            style="Modern.TEntry",
+        )
+        progress_value_entry.grid(row=1, column=0, sticky="ew", padx=(0, 8))
+        progress_total_entry.grid(row=1, column=1, sticky="ew", padx=(8, 0))
 
         def refresh_progress_mode() -> None:
             is_value_mode = progress_mode_var.get() == "value"
@@ -876,11 +1480,33 @@ class ScheduleApp:
             if not is_value_mode:
                 progress_total_var.set("100")
 
-        progress_mode_var.trace_add("write", lambda *_args: refresh_progress_mode())
+        progress_trace_id = progress_mode_var.trace_add(
+            "write", lambda *_args: refresh_progress_mode()
+        )
         refresh_progress_mode()
 
-        button_box = tk.Frame(dlg)
-        button_box.grid(row=6, column=0, columnspan=2, sticky="e", padx=8, pady=(8, 8))
+        dialog_closed = False
+
+        def close_dialog() -> None:
+            nonlocal dialog_closed
+            if dialog_closed:
+                return
+            dialog_closed = True
+            try:
+                progress_mode_var.trace_remove("write", progress_trace_id)
+            except tk.TclError:
+                pass
+            if dlg.grab_current() == dlg:
+                dlg.grab_release()
+            dlg.destroy()
+
+        dlg.protocol("WM_DELETE_WINDOW", close_dialog)
+
+        ttk.Separator(content, orient="horizontal").grid(
+            row=3, column=0, sticky="ew", padx=24, pady=(20, 14)
+        )
+        button_box = tk.Frame(content, bg=COLOR_SURFACE)
+        button_box.grid(row=4, column=0, sticky="e", padx=24, pady=(0, 22))
 
         def submit() -> None:
             task_text = task_var.get().strip()
@@ -961,16 +1587,30 @@ class ScheduleApp:
                 self._rebuild_rows()
                 return
             self._rebuild_rows()
-            dlg.destroy()
+            close_dialog()
 
-        tk.Button(button_box, text=BUTTON_OK, width=10, command=submit).grid(row=0, column=0)
-        tk.Button(button_box, text=BUTTON_CANCEL, width=10, command=dlg.destroy).grid(
+        ttk.Button(
+            button_box,
+            text=BUTTON_CANCEL,
+            width=10,
+            command=close_dialog,
+            style="Secondary.TButton",
+            cursor="hand2",
+        ).grid(row=0, column=0)
+        ttk.Button(
+            button_box,
+            text=BUTTON_OK,
+            width=10,
+            command=submit,
+            style="Primary.TButton",
+            cursor="hand2",
+        ).grid(
             row=0, column=1, padx=(8, 0)
         )
 
         task_entry.focus_set()
         dlg.bind("<Return>", lambda _event: submit())
-        dlg.bind("<Escape>", lambda _event: dlg.destroy())
+        dlg.bind("<Escape>", lambda _event: close_dialog())
 
         dlg.update_idletasks()
         self.root.update_idletasks()
@@ -1021,7 +1661,7 @@ class ScheduleApp:
             days = self._delay_days(location.entry)
             widgets.delay_label.configure(
                 text=f"{days}日" if days else "—",
-                fg="#c62828" if days else self.root.cget("fg") if "fg" in self.root.keys() else "black",
+                fg=COLOR_DANGER if days else COLOR_TEXT_MUTED,
             )
 
     def _redraw_all_gantt(self) -> None:
@@ -1041,7 +1681,6 @@ class ScheduleApp:
         width = canvas.winfo_width()
         height = canvas.winfo_height()
         if width <= 4 or height <= 4:
-            canvas.after(40, lambda item_id=entry_id: self._redraw_gantt_for(item_id))
             return
 
         start_all, end_all = self._visible_range()
@@ -1062,18 +1701,48 @@ class ScheduleApp:
             x1 = x_for(end_index)
             if x1 <= x0:
                 x1 = min(width - pad, x0 + 1)
-            y0, y1 = 4, height - 4
             is_parent = entry["kind"] == "parent"
-            remaining_color = "#90caf9" if is_parent else "#a5d6a7"
-            completed_color = "#1565c0" if is_parent else "#2e7d32"
-            canvas.create_rectangle(x0, y0, x1, y1, fill=remaining_color, outline="")
+            y0, y1 = (9, height - 9) if is_parent else (12, height - 12)
+            remaining_color = COLOR_PARENT_REMAINING if is_parent else COLOR_CHILD_REMAINING
+            completed_color = COLOR_PARENT_COMPLETE if is_parent else COLOR_CHILD_COMPLETE
+            create_rounded_rectangle(
+                canvas,
+                x0,
+                y0,
+                x1,
+                y1,
+                7,
+                fill=remaining_color,
+                outline=completed_color,
+                width=1,
+            )
             progress_x = x0 + (x1 - x0) * progress_ratio(entry)
             if progress_x > x0:
-                canvas.create_rectangle(x0, y0, progress_x, y1, fill=completed_color, outline="")
-            label = f"{span_days}日 / {progress_text(entry)}"
-            if x1 - x0 < 90:
-                label = f"{progress_ratio(entry):.0%}"
-            canvas.create_text((x0 + x1) / 2, (y0 + y1) / 2, text=label, fill="white")
+                create_rounded_rectangle(
+                    canvas,
+                    x0,
+                    y0,
+                    progress_x,
+                    y1,
+                    7,
+                    fill=completed_color,
+                    outline="",
+                )
+            bar_width = x1 - x0
+            if bar_width >= 36:
+                label = (
+                    f"{span_days}日  •  {progress_text(entry)}"
+                    if bar_width >= 90
+                    else f"{progress_ratio(entry):.0%}"
+                )
+                label_color = "white" if progress_ratio(entry) >= 0.55 else COLOR_TEXT
+                canvas.create_text(
+                    (x0 + x1) / 2,
+                    (y0 + y1) / 2,
+                    text=label,
+                    fill=label_color,
+                    font=self.small_font,
+                )
 
         if start_all <= self.current_jst_date <= end_all:
             if self.today_label_screen_x is not None:
@@ -1110,47 +1779,81 @@ class ScheduleApp:
         y_month = height / 2
         y_day = height - 3
 
-        current_year = date(start_all.year, 1, 1)
-        while current_year.year <= end_all.year:
-            segment_start = max(start_all, current_year)
-            is_last_supported_year = current_year.year == date.max.year
-            segment_end = end_all if is_last_supported_year else min(
-                end_all, date(current_year.year + 1, 1, 1) - timedelta(days=1)
-            )
-            if segment_start <= segment_end:
-                x0 = x_for((segment_start - start_all).days)
-                x1 = x_for((segment_end - start_all).days + 1)
-                if x1 - x0 > 40:
-                    canvas.create_text((x0 + x1) / 2, y_year, text=str(current_year.year), anchor="n")
-            if is_last_supported_year:
-                break
-            current_year = date(current_year.year + 1, 1, 1)
-
-        current_month = date(start_all.year, start_all.month, 1)
-        while current_month <= end_all:
-            is_last_supported_month = current_month.year == date.max.year and current_month.month == 12
-            next_month = None if is_last_supported_month else (
-                current_month.replace(day=28) + timedelta(days=4)
-            ).replace(day=1)
-            segment_start = max(start_all, current_month)
-            segment_end = end_all if next_month is None else min(end_all, next_month - timedelta(days=1))
+        total_years = end_all.year - start_all.year + 1
+        pixels_per_year = usable_w / total_years
+        year_step = max(1, math.ceil(56 / pixels_per_year))
+        current_year = start_all.year
+        while current_year <= end_all.year:
+            group_end_year = min(end_all.year, current_year + year_step - 1)
+            segment_start = max(start_all, date(current_year, 1, 1))
+            segment_end = min(end_all, date(group_end_year, 12, 31))
             x0 = x_for((segment_start - start_all).days)
             x1 = x_for((segment_end - start_all).days + 1)
-            if x1 - x0 > 24:
-                canvas.create_text((x0 + x1) / 2, y_month, text=str(current_month.month))
+            if x1 - x0 > 40:
+                year_label = (
+                    str(current_year)
+                    if group_end_year == current_year
+                    else f"{current_year}–{group_end_year}"
+                )
+                canvas.create_text(
+                    (x0 + x1) / 2,
+                    y_year,
+                    text=year_label,
+                    anchor="n",
+                    fill=COLOR_TEXT,
+                    font=self.header_font,
+                )
+            current_year += year_step
+
+        start_month_index = (start_all.year - 1) * 12 + start_all.month - 1
+        end_month_index = (end_all.year - 1) * 12 + end_all.month - 1
+        total_months = end_month_index - start_month_index + 1
+        pixels_per_month = usable_w / total_months
+        month_step = max(1, math.ceil(28 / pixels_per_month))
+        month_index = start_month_index
+        while month_index <= end_month_index:
+            month_year, zero_based_month = divmod(month_index, 12)
+            current_month = date(month_year + 1, zero_based_month + 1, 1)
+            next_month_index = month_index + 1
+            if next_month_index > (date.max.year * 12 - 1):
+                next_month = None
+            else:
+                next_year, next_zero_based_month = divmod(next_month_index, 12)
+                next_month = date(next_year + 1, next_zero_based_month + 1, 1)
+            segment_start = max(start_all, current_month)
+            segment_end = (
+                end_all
+                if next_month is None
+                else min(end_all, next_month - timedelta(days=1))
+            )
+            x0 = x_for((segment_start - start_all).days)
+            x1 = x_for((segment_end - start_all).days + 1)
+            if month_step == 1 and x1 - x0 > 24:
+                canvas.create_text(
+                    (x0 + x1) / 2,
+                    y_month,
+                    text=str(current_month.month),
+                    fill=COLOR_TEXT_MUTED,
+                    font=self.small_font,
+                )
             if pad <= x0 <= width - pad:
-                canvas.create_line(x0, 0, x0, height - 1, fill="#cccccc")
-            if next_month is None:
-                break
-            current_month = next_month
+                canvas.create_line(x0, 0, x0, height - 1, fill=COLOR_BORDER_SOFT)
+            month_index += month_step
 
         min_spacing = 24
         step = max(1, int((min_spacing / pixels_per_day) + 0.999))
 
         def draw_day_label(day_value: date) -> None:
             x = x_for((day_value - start_all).days)
-            canvas.create_line(x, height - 18, x, height - 1, fill="#999999")
-            label = canvas.create_text(x, y_day, text=str(day_value.day), anchor="s", fill="black")
+            canvas.create_line(x, height - 18, x, height - 1, fill=COLOR_BORDER)
+            label = canvas.create_text(
+                x,
+                y_day,
+                text=str(day_value.day),
+                anchor="s",
+                fill=TODAY_LINE_COLOR if day_value == self.current_jst_date else COLOR_TEXT_MUTED,
+                font=self.small_font,
+            )
             if day_value == self.current_jst_date:
                 bbox = canvas.bbox(label)
                 if bbox:
@@ -1178,11 +1881,18 @@ class ScheduleApp:
                 draw_day_label(self.current_jst_date)
 
         x_last = x_for(vis_days)
-        canvas.create_line(x_last, height - 18, x_last, height - 1, fill="#999999")
+        canvas.create_line(x_last, height - 18, x_last, height - 1, fill=COLOR_BORDER)
         if end_all < date.max:
             final_day = end_all + timedelta(days=1)
-            canvas.create_text(x_last, y_day, text=str(final_day.day), anchor="s")
-        canvas.create_line(pad, height - 1, width - pad, height - 1, fill="#bdbdbd")
+            canvas.create_text(
+                x_last,
+                y_day,
+                text=str(final_day.day),
+                anchor="s",
+                fill=COLOR_TEXT_MUTED,
+                font=self.small_font,
+            )
+        canvas.create_line(pad, height - 1, width - pad, height - 1, fill=COLOR_BORDER)
         self._redraw_all_gantt()
 
 
