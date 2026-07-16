@@ -1,4 +1,4 @@
-# [Schedule-board](https://github.com/taiyakisun/Schedule-board)
+# Schedule-board
 
 Schedule-boardは、親子グループ、進捗、遅延表示、Excel出力に対応した簡易ガントチャートアプリです。
 
