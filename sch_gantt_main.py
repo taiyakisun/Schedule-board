@@ -81,8 +81,11 @@ ERROR_SAVE_AFTER_LOAD = "読み込みに失敗したデータを保護するた�
 ERROR_COMPLETE_LOG_WRITE = "完了ログの書き込みに失敗しました。"
 ERROR_COMPLETE_LOG_READ = "完了ログの読み込みに失敗しました。"
 ERROR_EXCEL_EXPORT = "Excelファイルの出力に失敗しました。"
+ERROR_COMPLETION_RECOVERY = "中断された完了処理の復旧に失敗しました。アプリを終了し、データファイルを確認してください。"
 INFO_EXCEL_EXPORT_TITLE = "Excel出力"
 INFO_EXCEL_EXPORT = "Excelファイルを出力しました。\n{path}"
+INFO_DATA_RECOVERED_TITLE = "データを復旧しました"
+INFO_DATA_RECOVERED = "保存ファイルに問題があったため、直前の正常なデータから復旧しました。"
 WARNING_SELECT_PARENT_TITLE = "親の選択が必要です"
 WARNING_SELECT_PARENT_MESSAGE = "子を追加する親、またはその親に属する子を選択してください。"
 
@@ -165,6 +168,66 @@ def number_text(value: float | int) -> str:
     if numeric.is_integer():
         return str(int(numeric))
     return repr(numeric)
+
+
+def _sync_parent_directory(path: str) -> None:
+    if os.name == "nt":
+        return
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    try:
+        descriptor = os.open(directory, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    except OSError:
+        pass
+    finally:
+        os.close(descriptor)
+
+
+def _write_synced(path: str, payload: bytes) -> None:
+    with open(path, "wb") as fh:
+        fh.write(payload)
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
+def atomic_write_text(
+    path: str,
+    text: str,
+    *,
+    keep_backup: bool = True,
+    staging_path: str | None = None,
+) -> None:
+    temp_path = staging_path or f"{path}.tmp"
+    backup_path = f"{path}.bak"
+    backup_temp_path = f"{backup_path}.tmp"
+    payload = text.encode("utf-8")
+
+    _write_synced(temp_path, payload)
+    try:
+        if keep_backup and os.path.exists(path):
+            with open(path, "rb") as source:
+                previous_payload = source.read()
+            _write_synced(backup_temp_path, previous_payload)
+            os.replace(backup_temp_path, backup_path)
+        os.replace(temp_path, path)
+        _sync_parent_directory(path)
+    finally:
+        if os.path.exists(backup_temp_path):
+            try:
+                os.remove(backup_temp_path)
+            except OSError:
+                pass
+
+
+def _schedule_text(schedule: dict) -> str:
+    return json.dumps(
+        serialize_schedule(schedule),
+        ensure_ascii=False,
+        indent=2,
+    ) + "\n"
 
 
 def create_rounded_rectangle(
@@ -417,36 +480,59 @@ class ScheduleApp:
 
     # ----- persistence -----
     def _load(self) -> None:
-        if not os.path.exists(DATA_FILE):
+        if not self._recover_pending_completion():
+            self.load_failed = True
+            return
+
+        candidates = (DATA_FILE, f"{DATA_FILE}.bak", f"{DATA_FILE}.tmp")
+        existing_candidates = [path for path in candidates if os.path.exists(path)]
+        if not existing_candidates:
             self.load_failed = False
             return
-        try:
-            with open(DATA_FILE, "r", encoding="utf-8") as fh:
-                raw = json.load(fh)
-            self.schedule = deserialize_schedule(raw)
+
+        errors = []
+        for path in existing_candidates:
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    raw = json.load(fh)
+                schedule = deserialize_schedule(raw)
+            except Exception as exc:
+                errors.append(f"{os.path.basename(path)}: {exc}")
+                continue
+
+            if path != DATA_FILE:
+                try:
+                    atomic_write_text(
+                        DATA_FILE,
+                        _schedule_text(schedule),
+                        keep_backup=False,
+                        staging_path=(
+                            f"{DATA_FILE}.recovery.tmp"
+                            if path == f"{DATA_FILE}.tmp"
+                            else None
+                        ),
+                    )
+                except Exception as exc:
+                    errors.append(f"復旧保存: {exc}")
+                    messagebox.showerror(ERROR_INPUT_TITLE, f"{ERROR_LOAD}\n" + "\n".join(errors))
+                    self.load_failed = True
+                    return
+                messagebox.showwarning(INFO_DATA_RECOVERED_TITLE, INFO_DATA_RECOVERED)
+            self.schedule = schedule
             self.entries = self.schedule["parents"]
             self.load_failed = False
-        except Exception as exc:
-            messagebox.showerror(ERROR_INPUT_TITLE, f"{ERROR_LOAD}\n{exc}")
-            self.load_failed = True
+            return
+
+        messagebox.showerror(ERROR_INPUT_TITLE, f"{ERROR_LOAD}\n" + "\n".join(errors))
+        self.load_failed = True
 
     def _save(self) -> bool:
         if getattr(self, "load_failed", False):
             messagebox.showerror(ERROR_INPUT_TITLE, ERROR_SAVE_AFTER_LOAD)
             return False
-        temp_file = f"{DATA_FILE}.tmp"
         try:
-            data = serialize_schedule(self.schedule)
-            with open(temp_file, "w", encoding="utf-8", newline="\n") as fh:
-                json.dump(data, fh, ensure_ascii=False, indent=2)
-                fh.write("\n")
-            os.replace(temp_file, DATA_FILE)
+            atomic_write_text(DATA_FILE, _schedule_text(self.schedule))
         except Exception as exc:
-            try:
-                if os.path.exists(temp_file):
-                    os.remove(temp_file)
-            except OSError:
-                pass
             messagebox.showerror(ERROR_INPUT_TITLE, f"{ERROR_SAVE}\n{exc}")
             return False
         return True
@@ -480,63 +566,179 @@ class ScheduleApp:
             LOG_FIELD_PROGRESS_TOTAL: entry.get("progress_total", 100),
         }
 
+    def _completion_journal_path(self) -> str:
+        return f"{COMPLETE_LOG_FILE}.pending"
+
+    def _parse_completion_records(self, path: str) -> tuple[list[dict], bool]:
+        with open(path, "rb") as fh:
+            payload = fh.read()
+        truncated_tail = False
+        try:
+            text = payload.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            last_line_start = payload.rfind(b"\n") + 1
+            is_torn_tail = (
+                not payload.endswith((b"\n", b"\r"))
+                and exc.start >= last_line_start
+            )
+            if not is_torn_tail:
+                raise
+            text = payload[:last_line_start].decode("utf-8")
+            truncated_tail = True
+        lines = text.splitlines()
+        records = []
+        for index, line in enumerate(lines):
+            if not line.strip():
+                continue
+            try:
+                raw = json.loads(line)
+            except json.JSONDecodeError as exc:
+                is_torn_tail = index == len(lines) - 1 and not text.endswith(("\n", "\r"))
+                if is_torn_tail:
+                    truncated_tail = True
+                    break
+                raise ValueError(f"{index + 1}行目: JSONの解析に失敗しました。 {exc}") from exc
+            if not isinstance(raw, dict):
+                raise ValueError(f"{index + 1}行目: JSONオブジェクトを記載してください。")
+            records.append(raw)
+        return records, truncated_tail
+
+    def _read_completion_records(self) -> tuple[list[dict], bool]:
+        candidates = (
+            COMPLETE_LOG_FILE,
+            f"{COMPLETE_LOG_FILE}.bak",
+            f"{COMPLETE_LOG_FILE}.tmp",
+        )
+        existing_candidates = [path for path in candidates if os.path.exists(path)]
+        if not existing_candidates:
+            return [], False
+
+        errors = []
+        for path in existing_candidates:
+            try:
+                records, truncated_tail = self._parse_completion_records(path)
+            except Exception as exc:
+                errors.append(f"{os.path.basename(path)}: {exc}")
+                continue
+            if path != COMPLETE_LOG_FILE:
+                clean_text = "".join(
+                    json.dumps(record, ensure_ascii=False) + "\n"
+                    for record in records
+                )
+                atomic_write_text(
+                    COMPLETE_LOG_FILE,
+                    clean_text,
+                    keep_backup=False,
+                    staging_path=(
+                        f"{COMPLETE_LOG_FILE}.recovery.tmp"
+                        if path == f"{COMPLETE_LOG_FILE}.tmp"
+                        else None
+                    ),
+                )
+            return records, truncated_tail
+
+        raise ValueError("\n".join(errors))
+
+    def _merge_completion_records(self, records: list[dict]) -> None:
+        existing, _truncated_tail = self._read_completion_records()
+        known = {
+            json.dumps(record, ensure_ascii=False, sort_keys=True)
+            for record in existing
+        }
+        for record in records:
+            key = json.dumps(record, ensure_ascii=False, sort_keys=True)
+            if key not in known:
+                existing.append(record)
+                known.add(key)
+        text = "".join(
+            json.dumps(record, ensure_ascii=False) + "\n"
+            for record in existing
+        )
+        atomic_write_text(COMPLETE_LOG_FILE, text)
+
+    def _finish_completion_transaction(self, journal: dict) -> None:
+        if journal.get("version") != 1:
+            raise ValueError("完了処理ジャーナルのバージョンが不正です。")
+        records = journal.get("records")
+        if not isinstance(records, list) or not all(isinstance(record, dict) for record in records):
+            raise ValueError("完了処理ジャーナルのログが不正です。")
+        schedule = deserialize_schedule(journal.get("schedule"))
+        self._merge_completion_records(records)
+        atomic_write_text(DATA_FILE, _schedule_text(schedule))
+        journal_path = self._completion_journal_path()
+        if os.path.exists(journal_path):
+            os.remove(journal_path)
+            _sync_parent_directory(journal_path)
+
+    def _recover_pending_completion(self) -> bool:
+        journal_path = self._completion_journal_path()
+        if not os.path.exists(journal_path):
+            return True
+        try:
+            with open(journal_path, "r", encoding="utf-8") as fh:
+                journal = json.load(fh)
+            if not isinstance(journal, dict):
+                raise ValueError("完了処理ジャーナルが不正です。")
+            self._finish_completion_transaction(journal)
+        except Exception as exc:
+            messagebox.showerror(ERROR_INPUT_TITLE, f"{ERROR_COMPLETION_RECOVERY}\n{exc}")
+            return False
+        return True
+
     def _append_completion_logs(self, entries: list[dict]) -> bool:
         records = [self._completion_record(entry) for entry in entries]
         try:
-            with open(COMPLETE_LOG_FILE, "a", encoding="utf-8", newline="\n") as fh:
-                fh.writelines(json.dumps(record, ensure_ascii=False) + "\n" for record in records)
+            self._merge_completion_records(records)
         except Exception as exc:
             messagebox.showerror(ERROR_INPUT_TITLE, f"{ERROR_COMPLETE_LOG_WRITE}\n{exc}")
             return False
         return True
 
     def _load_latest_completion_states(self) -> dict[tuple, dict] | None:
-        if not os.path.exists(COMPLETE_LOG_FILE):
-            return {}
-
         latest_records: dict[tuple, dict] = {}
         try:
-            with open(COMPLETE_LOG_FILE, "r", encoding="utf-8") as fh:
-                for line_no, line in enumerate(fh, start=1):
-                    text = line.strip()
-                    if not text:
-                        continue
-                    try:
-                        raw = json.loads(text)
-                    except json.JSONDecodeError as exc:
-                        raise ValueError(f"{line_no}行目: JSONの解析に失敗しました。 {exc}") from exc
-                    if not isinstance(raw, dict):
-                        raise ValueError(f"{line_no}行目: JSONオブジェクトを記載してください。")
-                    missing = [
-                        field
-                        for field in (
-                            LOG_FIELD_TASK,
-                            LOG_FIELD_START,
-                            LOG_FIELD_END,
-                            LOG_FIELD_COMPLETED_AT,
-                            LOG_FIELD_COMPLETED,
-                        )
-                        if field not in raw
-                    ]
-                    if missing:
-                        raise ValueError(f"{line_no}行目: 必須キーが不足しています。 {', '.join(missing)}")
+            records, truncated_tail = self._read_completion_records()
+            if truncated_tail:
+                clean_text = "".join(
+                    json.dumps(record, ensure_ascii=False) + "\n"
+                    for record in records
+                )
+                atomic_write_text(COMPLETE_LOG_FILE, clean_text)
+            for line_no, raw in enumerate(records, start=1):
+                missing = [
+                    field
+                    for field in (
+                        LOG_FIELD_TASK,
+                        LOG_FIELD_START,
+                        LOG_FIELD_END,
+                        LOG_FIELD_COMPLETED_AT,
+                        LOG_FIELD_COMPLETED,
+                    )
+                    if field not in raw
+                ]
+                if missing:
+                    raise ValueError(
+                        f"{line_no}行目: 必須キーが不足しています。 {', '.join(missing)}"
+                    )
 
-                    task = str(raw[LOG_FIELD_TASK])
-                    try:
-                        start = parse_date(str(raw[LOG_FIELD_START]))
-                        end = parse_date(str(raw[LOG_FIELD_END]))
-                    except Exception as exc:
-                        raise ValueError(f"{line_no}行目: 開始日または終了日が不正です。") from exc
+                task = str(raw[LOG_FIELD_TASK])
+                try:
+                    start = parse_date(str(raw[LOG_FIELD_START]))
+                    end = parse_date(str(raw[LOG_FIELD_END]))
+                except Exception as exc:
+                    raise ValueError(
+                        f"{line_no}行目: 開始日または終了日が不正です。"
+                    ) from exc
 
-                    record_id = str(raw.get(LOG_FIELD_ID, "")).strip()
-                    key = ("id", record_id) if record_id else entry_key(task, start, end)
-                    latest_records.pop(key, None)
-                    latest_records[key] = {
-                        **raw,
-                        "task": task,
-                        "start": start,
-                        "end": end,
-                    }
+                record_id = str(raw.get(LOG_FIELD_ID, "")).strip()
+                key = ("id", record_id) if record_id else entry_key(task, start, end)
+                latest_records.pop(key, None)
+                latest_records[key] = {
+                    **raw,
+                    "task": task,
+                    "start": start,
+                    "end": end,
+                }
         except Exception as exc:
             messagebox.showerror(ERROR_INPUT_TITLE, f"{ERROR_COMPLETE_LOG_READ}\n{exc}")
             return None
@@ -1253,18 +1455,38 @@ class ScheduleApp:
 
         snapshot = self._snapshot_schedule()
         previous_selection = self.selected_id
+        records = [self._completion_record(target) for target in targets]
         remove_entry(self.schedule, entry_id)
         self.selected_id = location.parent["id"] if entry["kind"] == "child" else None
         if self.selected_id and self._find(self.selected_id) is None:
             self.selected_id = None
-        if not self._save_or_restore(snapshot):
+
+        journal = {
+            "version": 1,
+            "records": records,
+            "schedule": serialize_schedule(self.schedule),
+        }
+        journal_path = self._completion_journal_path()
+        try:
+            atomic_write_text(
+                journal_path,
+                json.dumps(journal, ensure_ascii=False, indent=2) + "\n",
+                keep_backup=False,
+            )
+        except Exception as exc:
+            messagebox.showerror(ERROR_INPUT_TITLE, f"{ERROR_COMPLETE_LOG_WRITE}\n{exc}")
+            self._restore_schedule(snapshot)
             self.selected_id = previous_selection
             self._rebuild_rows()
             return
-        if not self._append_completion_logs(targets):
+
+        try:
+            self._finish_completion_transaction(journal)
+        except Exception as exc:
+            messagebox.showerror(ERROR_INPUT_TITLE, f"{ERROR_COMPLETION_RECOVERY}\n{exc}")
             self._restore_schedule(snapshot)
             self.selected_id = previous_selection
-            self._save()
+            self.load_failed = True
             self._rebuild_rows()
             return
         self._rebuild_rows()
@@ -1394,6 +1616,7 @@ class ScheduleApp:
         )
         content.grid(row=0, column=0, sticky="nsew", padx=16, pady=16)
         content.columnconfigure(0, weight=1)
+        tk.Frame(content, height=3, bg=COLOR_PRIMARY).place(x=0, y=0, relwidth=1)
 
         tk.Label(
             content,
@@ -1440,7 +1663,7 @@ class ScheduleApp:
             form,
             text=LABEL_TASK_NAME,
             bg=COLOR_SURFACE,
-            fg=COLOR_TEXT,
+            fg=COLOR_TEXT_MUTED,
             font=self.header_font,
             anchor="w",
         ).grid(row=0, column=0, sticky="ew", pady=(0, 6))
@@ -1460,7 +1683,7 @@ class ScheduleApp:
             dates_frame,
             text=LABEL_START_DATE,
             bg=COLOR_SURFACE,
-            fg=COLOR_TEXT,
+            fg=COLOR_TEXT_MUTED,
             font=self.header_font,
             anchor="w",
         ).grid(row=0, column=0, sticky="ew", padx=(0, 8), pady=(0, 6))
@@ -1468,7 +1691,7 @@ class ScheduleApp:
             dates_frame,
             text=LABEL_END_DATE,
             bg=COLOR_SURFACE,
-            fg=COLOR_TEXT,
+            fg=COLOR_TEXT_MUTED,
             font=self.header_font,
             anchor="w",
         ).grid(row=0, column=1, sticky="ew", padx=(8, 0), pady=(0, 6))
@@ -1491,7 +1714,7 @@ class ScheduleApp:
             form,
             text=LABEL_PROGRESS_MODE,
             bg=COLOR_SURFACE,
-            fg=COLOR_TEXT,
+            fg=COLOR_TEXT_MUTED,
             font=self.header_font,
             anchor="w",
         ).grid(row=3, column=0, sticky="ew", pady=(0, 6))
@@ -1520,7 +1743,7 @@ class ScheduleApp:
             progress_frame,
             text=LABEL_PROGRESS_VALUE,
             bg=COLOR_SURFACE,
-            fg=COLOR_TEXT,
+            fg=COLOR_TEXT_MUTED,
             font=self.header_font,
             anchor="w",
         ).grid(row=0, column=0, sticky="ew", padx=(0, 8), pady=(0, 6))
@@ -1528,7 +1751,7 @@ class ScheduleApp:
             progress_frame,
             text=LABEL_PROGRESS_TOTAL,
             bg=COLOR_SURFACE,
-            fg=COLOR_TEXT,
+            fg=COLOR_TEXT_MUTED,
             font=self.header_font,
             anchor="w",
         ).grid(row=0, column=1, sticky="ew", padx=(8, 0), pady=(0, 6))
@@ -1578,8 +1801,19 @@ class ScheduleApp:
         ttk.Separator(content, orient="horizontal").grid(
             row=3, column=0, sticky="ew", padx=24, pady=(20, 14)
         )
-        button_box = tk.Frame(content, bg=COLOR_SURFACE)
-        button_box.grid(row=4, column=0, sticky="e", padx=24, pady=(0, 22))
+        footer = tk.Frame(content, bg=COLOR_SURFACE)
+        footer.grid(row=4, column=0, sticky="ew", padx=24, pady=(0, 22))
+        footer.columnconfigure(0, weight=1)
+        tk.Label(
+            footer,
+            text="Enterで保存  ·  Escで閉じる",
+            bg=COLOR_SURFACE,
+            fg=COLOR_TEXT_MUTED,
+            font=self.small_font,
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w")
+        button_box = tk.Frame(footer, bg=COLOR_SURFACE)
+        button_box.grid(row=0, column=1, sticky="e")
 
         def submit() -> None:
             task_text = task_var.get().strip()
@@ -1770,9 +2004,56 @@ class ScheduleApp:
         vis_days = max(1, (end_all - start_all).days + 1)
         pad = 4
         usable_w = max(1, width - 2 * pad)
+        pixels_per_day = usable_w / vis_days
 
         def x_for(index_value: int | float) -> float:
             return pad + usable_w * (index_value / vis_days)
+
+        if pixels_per_day >= 2:
+            days_to_weekend = (5 - start_all.weekday()) % 7
+            weekend = (
+                start_all + timedelta(days=days_to_weekend)
+                if days_to_weekend <= (date.max - start_all).days
+                else None
+            )
+            weekend_color = (
+                COLOR_SELECTED_WEEKEND
+                if widgets.entry_id == self.selected_id
+                else COLOR_WEEKEND
+            )
+            while weekend is not None and weekend <= end_all:
+                weekend_end = (
+                    weekend
+                    if weekend == date.max
+                    else min(end_all, weekend + timedelta(days=1))
+                )
+                canvas.create_rectangle(
+                    x_for((weekend - start_all).days),
+                    0,
+                    x_for((weekend_end - start_all).days + 1),
+                    height,
+                    fill=weekend_color,
+                    outline="",
+                )
+                if (date.max - weekend).days < 7:
+                    break
+                weekend += timedelta(days=7)
+
+        x_today = None
+        if start_all <= self.current_jst_date <= end_all:
+            if self.today_label_screen_x is not None:
+                x_today = self.today_label_screen_x - canvas.winfo_rootx()
+            else:
+                today_index = (self.current_jst_date - start_all).days + 0.5
+                x_today = x_for(today_index)
+            canvas.create_rectangle(
+                max(0, x_today - max(3, pixels_per_day / 2)),
+                0,
+                min(width, x_today + max(3, pixels_per_day / 2)),
+                height,
+                fill=TODAY_HIGHLIGHT_BG,
+                outline="",
+            )
 
         if self._effective_visible(entry, parent):
             start_index = max(0, min(vis_days, (entry["start"] - start_all).days))
@@ -1794,8 +2075,12 @@ class ScheduleApp:
                 y1,
                 7,
                 fill=remaining_color,
-                outline=completed_color,
-                width=1,
+                outline=(
+                    COLOR_PRIMARY
+                    if widgets.entry_id == self.selected_id
+                    else completed_color
+                ),
+                width=2 if widgets.entry_id == self.selected_id else 1,
             )
             progress_x = x0 + (x1 - x0) * progress_ratio(entry)
             if progress_x > x0:
@@ -1825,12 +2110,7 @@ class ScheduleApp:
                     font=self.small_font,
                 )
 
-        if start_all <= self.current_jst_date <= end_all:
-            if self.today_label_screen_x is not None:
-                x_today = self.today_label_screen_x - canvas.winfo_rootx()
-            else:
-                today_index = (self.current_jst_date - start_all).days + 0.5
-                x_today = x_for(today_index)
+        if x_today is not None:
             canvas.create_line(max(0, min(width, x_today)), 0, max(0, min(width, x_today)), height, fill=TODAY_LINE_COLOR, width=2)
 
     def _redraw_scale(self) -> None:
@@ -1855,6 +2135,31 @@ class ScheduleApp:
 
         def x_for(index_value: int | float) -> float:
             return pad + usable_w * (index_value / vis_days)
+
+        if pixels_per_day >= 3:
+            days_to_weekend = (5 - start_all.weekday()) % 7
+            weekend = (
+                start_all + timedelta(days=days_to_weekend)
+                if days_to_weekend <= (date.max - start_all).days
+                else None
+            )
+            while weekend is not None and weekend <= end_all:
+                weekend_end = (
+                    weekend
+                    if weekend == date.max
+                    else min(end_all, weekend + timedelta(days=1))
+                )
+                canvas.create_rectangle(
+                    x_for((weekend - start_all).days),
+                    0,
+                    x_for((weekend_end - start_all).days + 1),
+                    height,
+                    fill=COLOR_WEEKEND,
+                    outline="",
+                )
+                if (date.max - weekend).days < 7:
+                    break
+                weekend += timedelta(days=7)
 
         y_year = 12
         y_month = height / 2
@@ -1913,12 +2218,12 @@ class ScheduleApp:
                 canvas.create_text(
                     (x0 + x1) / 2,
                     y_month,
-                    text=str(current_month.month),
+                    text=f"{current_month.month}月",
                     fill=COLOR_TEXT_MUTED,
                     font=self.small_font,
                 )
             if pad <= x0 <= width - pad:
-                canvas.create_line(x0, 0, x0, height - 1, fill=COLOR_BORDER_SOFT)
+                canvas.create_line(x0, 0, x0, height - 1, fill=COLOR_GRID)
             month_index += month_step
 
         min_spacing = 24
@@ -1932,19 +2237,21 @@ class ScheduleApp:
                 y_day,
                 text=str(day_value.day),
                 anchor="s",
-                fill=TODAY_LINE_COLOR if day_value == self.current_jst_date else COLOR_TEXT_MUTED,
+                fill="white" if day_value == self.current_jst_date else COLOR_TEXT_MUTED,
                 font=self.small_font,
             )
             if day_value == self.current_jst_date:
                 bbox = canvas.bbox(label)
                 if bbox:
                     self.today_label_screen_x = canvas.winfo_rootx() + ((bbox[0] + bbox[2]) / 2)
-                    highlight = canvas.create_rectangle(
+                    highlight = create_rounded_rectangle(
+                        canvas,
                         bbox[0] - 2,
                         bbox[1] - 1,
                         bbox[2] + 2,
                         bbox[3] + 1,
-                        fill=TODAY_HIGHLIGHT_BG,
+                        4,
+                        fill=TODAY_LINE_COLOR,
                         outline="",
                     )
                     canvas.tag_lower(highlight, label)

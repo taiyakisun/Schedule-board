@@ -225,7 +225,11 @@ class ScheduleAppLogicTests(unittest.TestCase):
         app._refresh_delay_labels()
 
         delay_label.configure.assert_called_once_with(
-            text="1日", fg=app_module.COLOR_DANGER
+            text="1日遅延",
+            fg=app_module.COLOR_DANGER,
+            bg=app_module.COLOR_DANGER_SOFT,
+            padx=4,
+            pady=2,
         )
 
     def test_delete_rolls_back_when_schedule_save_fails(self) -> None:
@@ -261,15 +265,196 @@ class ScheduleAppLogicTests(unittest.TestCase):
             ):
                 app._on_complete(parent["id"])
 
-            saved = json.loads(data_file.read_text(encoding="utf-8"))
-
         self.assertEqual([entry["id"] for entry in app.entries], [parent["id"]])
         self.assertEqual(
             [entry["id"] for entry in app.entries[0]["children"]],
             [child_a["id"], child_b["id"]],
         )
-        self.assertEqual(saved["parents"][0]["id"], parent["id"])
+        self.assertFalse(data_file.exists())
         showerror.assert_called_once()
+
+    def test_atomic_save_keeps_previous_generation_as_backup(self) -> None:
+        parent, _child_a, _child_b = self.make_hierarchy()
+        app = self.make_app([parent])
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_file = Path(temp_dir) / "schedules.json"
+            with (
+                patch.object(app_module, "DATA_FILE", str(data_file)),
+                patch.object(app_module.os, "fsync", wraps=app_module.os.fsync) as fsync,
+                patch.object(app_module.messagebox, "showerror") as showerror,
+            ):
+                self.assertTrue(app._save())
+                parent["task"] = "Updated parent"
+                self.assertTrue(app._save())
+
+            backup = json.loads(Path(f"{data_file}.bak").read_text(encoding="utf-8"))
+            current = json.loads(data_file.read_text(encoding="utf-8"))
+
+        self.assertEqual(backup["parents"][0]["task"], "Parent")
+        self.assertEqual(current["parents"][0]["task"], "Updated parent")
+        self.assertGreaterEqual(fsync.call_count, 3)
+        showerror.assert_not_called()
+
+    def test_load_recovers_corrupt_primary_from_valid_backup(self) -> None:
+        parent, _child_a, _child_b = self.make_hierarchy()
+        app = self.make_app()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_file = Path(temp_dir) / "schedules.json"
+            data_file.write_text('{"version": 2, "parents": ', encoding="utf-8")
+            Path(f"{data_file}.bak").write_text(
+                json.dumps(
+                    app_module.serialize_schedule({"version": 2, "parents": [parent]}),
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            with (
+                patch.object(app_module, "DATA_FILE", str(data_file)),
+                patch.object(app_module, "COMPLETE_LOG_FILE", str(Path(temp_dir) / "completed.jsonl")),
+                patch.object(app_module.messagebox, "showwarning") as showwarning,
+                patch.object(app_module.messagebox, "showerror") as showerror,
+            ):
+                app._load()
+
+            repaired = json.loads(data_file.read_text(encoding="utf-8"))
+
+        self.assertFalse(app.load_failed)
+        self.assertEqual(app.entries[0]["id"], parent["id"])
+        self.assertEqual(repaired["parents"][0]["id"], parent["id"])
+        showwarning.assert_called_once()
+        showerror.assert_not_called()
+
+    def test_failed_tmp_recovery_preserves_the_only_valid_copy(self) -> None:
+        parent, _child_a, _child_b = self.make_hierarchy()
+        app = self.make_app()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_file = Path(temp_dir) / "schedules.json"
+            temp_file = Path(f"{data_file}.tmp")
+            temp_file.write_text(
+                app_module._schedule_text({"version": 2, "parents": [parent]}),
+                encoding="utf-8",
+                newline="\n",
+            )
+            real_replace = app_module.os.replace
+
+            def fail_primary_replace(source: str, destination: str) -> None:
+                if str(destination) == str(data_file):
+                    raise OSError("simulated replace failure")
+                real_replace(source, destination)
+
+            with (
+                patch.object(app_module, "DATA_FILE", str(data_file)),
+                patch.object(app_module, "COMPLETE_LOG_FILE", str(Path(temp_dir) / "completed.jsonl")),
+                patch.object(app_module.os, "replace", side_effect=fail_primary_replace),
+                patch.object(app_module.messagebox, "showerror") as showerror,
+            ):
+                app._load()
+
+            preserved = json.loads(temp_file.read_text(encoding="utf-8"))
+
+        self.assertTrue(app.load_failed)
+        self.assertEqual(preserved["parents"][0]["id"], parent["id"])
+        showerror.assert_called_once()
+
+    def test_pending_completion_journal_is_replayed_idempotently(self) -> None:
+        parent, _child_a, _child_b = self.make_hierarchy()
+        app = self.make_app([parent])
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_file = Path(temp_dir) / "schedules.json"
+            log_file = Path(temp_dir) / "completed_tasks.jsonl"
+            data_file.write_text(
+                app_module._schedule_text(app.schedule), encoding="utf-8", newline="\n"
+            )
+            record = app._completion_record(parent)
+            journal = {
+                "version": 1,
+                "records": [record],
+                "schedule": {"version": 2, "parents": []},
+            }
+            pending = Path(f"{log_file}.pending")
+            pending.write_text(
+                json.dumps(journal, ensure_ascii=False), encoding="utf-8", newline="\n"
+            )
+            with (
+                patch.object(app_module, "DATA_FILE", str(data_file)),
+                patch.object(app_module, "COMPLETE_LOG_FILE", str(log_file)),
+                patch.object(app_module.messagebox, "showerror") as showerror,
+            ):
+                app._load()
+                pending.write_text(
+                    json.dumps(journal, ensure_ascii=False),
+                    encoding="utf-8",
+                    newline="\n",
+                )
+                app._load()
+
+            saved = json.loads(data_file.read_text(encoding="utf-8"))
+            records = [json.loads(line) for line in log_file.read_text(encoding="utf-8").splitlines()]
+
+        self.assertEqual(saved["parents"], [])
+        self.assertEqual([item[app_module.LOG_FIELD_ID] for item in records], [parent["id"]])
+        self.assertFalse(pending.exists())
+        self.assertFalse(app.load_failed)
+        showerror.assert_not_called()
+
+    def test_atomic_log_update_salvages_only_a_torn_final_line(self) -> None:
+        parent, child_a, _child_b = self.make_hierarchy()
+        app = self.make_app([parent])
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_file = Path(temp_dir) / "completed_tasks.jsonl"
+            first = app._completion_record(parent)
+            log_file.write_bytes(
+                (json.dumps(first, ensure_ascii=False) + "\n").encode("utf-8")
+                + '{"途中":"あ'.encode("utf-8")[:-1]
+            )
+            with (
+                patch.object(app_module, "COMPLETE_LOG_FILE", str(log_file)),
+                patch.object(app_module.messagebox, "showerror") as showerror,
+            ):
+                self.assertTrue(app._append_completion_logs([child_a]))
+
+            records = [json.loads(line) for line in log_file.read_text(encoding="utf-8").splitlines()]
+            backup_exists = Path(f"{log_file}.bak").exists()
+
+        self.assertEqual(
+            [item[app_module.LOG_FIELD_ID] for item in records],
+            [parent["id"], child_a["id"]],
+        )
+        self.assertTrue(backup_exists)
+        showerror.assert_not_called()
+
+    def test_completion_log_recovers_from_valid_backup(self) -> None:
+        parent, _child_a, _child_b = self.make_hierarchy()
+        app = self.make_app([parent])
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_file = Path(temp_dir) / "completed_tasks.jsonl"
+            record = app._completion_record(parent)
+            log_file.write_text('{"壊れた行"\n', encoding="utf-8", newline="\n")
+            Path(f"{log_file}.bak").write_text(
+                json.dumps(record, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            with (
+                patch.object(app_module, "COMPLETE_LOG_FILE", str(log_file)),
+                patch.object(app_module.messagebox, "showerror") as showerror,
+            ):
+                latest = app._load_latest_completion_states()
+
+            repaired = [
+                json.loads(line)
+                for line in log_file.read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertIsNotNone(latest)
+        self.assertEqual(repaired[0][app_module.LOG_FIELD_ID], parent["id"])
+        showerror.assert_not_called()
 
     def test_failed_v2_load_blocks_overwrite_and_preserves_current_model(self) -> None:
         parent, _child_a, _child_b = self.make_hierarchy()

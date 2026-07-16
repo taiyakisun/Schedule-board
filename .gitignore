@@ -31,7 +31,14 @@ Desktop.ini
 
 # Application-local data and generated exports
 schedules.json
+schedules.json.bak
+schedules.json.tmp
+schedules.json.recovery.tmp
 completed_tasks.jsonl
+completed_tasks.jsonl.bak
+completed_tasks.jsonl.tmp
+completed_tasks.jsonl.recovery.tmp
+completed_tasks.jsonl.pending
+completed_tasks.jsonl.pending.tmp
 outputs/
 ~$*.xlsx
-
