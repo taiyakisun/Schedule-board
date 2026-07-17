@@ -273,6 +273,52 @@ class ScheduleModelTests(unittest.TestCase):
                 progress_total=0,
             )
 
+    def test_parent_progress_uses_average_of_children_when_present(self) -> None:
+        parent = new_entry(
+            KIND_PARENT,
+            "Parent",
+            "2026-07-01",
+            "2026-07-10",
+            progress_mode=PROGRESS_VALUE,
+            progress_value=9,
+            progress_total=10,
+        )
+        parent["children"] = [
+            new_entry(
+                KIND_CHILD,
+                "Complete",
+                "2026-07-01",
+                "2026-07-02",
+                parent_id=parent["id"],
+                progress_value=100,
+            ),
+            new_entry(
+                KIND_CHILD,
+                "Not started A",
+                "2026-07-03",
+                "2026-07-04",
+                parent_id=parent["id"],
+                progress_mode=PROGRESS_VALUE,
+                progress_value=0,
+                progress_total=4,
+            ),
+            new_entry(
+                KIND_CHILD,
+                "Not started B",
+                "2026-07-05",
+                "2026-07-06",
+                parent_id=parent["id"],
+                progress_value=0,
+            ),
+        ]
+
+        self.assertAlmostEqual(progress_ratio(parent), 1 / 3)
+        self.assertEqual(progress_text(parent), "33%")
+
+        parent["children"].clear()
+        self.assertEqual(progress_ratio(parent), 0.9)
+        self.assertEqual(progress_text(parent), "9 / 10 (90%)")
+
     def test_delay_boundaries_use_the_supplied_calendar_date(self) -> None:
         entry = self.make_parent("parent-1")
 

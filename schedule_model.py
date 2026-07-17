@@ -335,6 +335,10 @@ def _safe_number(value: object, default: float) -> float:
 
 
 def progress_ratio(entry: dict) -> float:
+    children = entry.get("children", [])
+    if isinstance(children, list) and children:
+        return sum(progress_ratio(child) for child in children) / len(children)
+
     value = _safe_number(entry.get("progress_value", 0), 0.0)
     if entry.get("progress_mode", PROGRESS_PERCENT) == PROGRESS_VALUE:
         total = _safe_number(entry.get("progress_total", 0), 0.0)
@@ -353,6 +357,10 @@ def _format_number(value: float) -> str:
 
 def progress_text(entry: dict) -> str:
     ratio = progress_ratio(entry)
+    children = entry.get("children", [])
+    if isinstance(children, list) and children:
+        return f"{ratio:.0%}"
+
     percent = _format_number(round(ratio * 100, 2))
     if entry.get("progress_mode", PROGRESS_PERCENT) != PROGRESS_VALUE:
         return f"{percent}%"

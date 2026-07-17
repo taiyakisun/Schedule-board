@@ -75,6 +75,8 @@ class _Progress:
 
     @property
     def label(self) -> str:
+        if self.mode == "aggregate":
+            return f"{self.current:.0f}%"
         if self.mode == "percent":
             return f"{_format_number(self.current)}%"
         return f"{_format_number(self.current)} / {_format_number(self.total)}"
@@ -151,6 +153,25 @@ def _normalize_rows(
         if isinstance(children, (str, bytes)) or not isinstance(children, Sequence):
             raise TypeError(f"parents[{parent_index}].childrenは配列で指定してください。")
 
+        child_progresses: list[_Progress] = []
+        for child_index, child in enumerate(children):
+            path = f"parents[{parent_index}].children[{child_index}]"
+            if not isinstance(child, Mapping):
+                raise TypeError(f"{path}はオブジェクトで指定してください。")
+            child_progresses.append(_progress(child, path))
+
+        parent_progress = _progress(parent, f"parents[{parent_index}]")
+        if child_progresses:
+            parent_progress = _Progress(
+                mode="aggregate",
+                current=(
+                    sum(progress.rate for progress in child_progresses)
+                    * 100
+                    / len(child_progresses)
+                ),
+                total=100.0,
+            )
+
         rows.append(
             _ExportRow(
                 kind="親",
@@ -162,7 +183,7 @@ def _normalize_rows(
                 start=parent_start,
                 end=parent_end,
                 effective_visible=parent_visible,
-                progress=_progress(parent, f"parents[{parent_index}]"),
+                progress=parent_progress,
                 delay_days=max(0, (today - parent_end).days),
                 collapsed=bool(children) and not expanded,
             )
@@ -170,8 +191,6 @@ def _normalize_rows(
 
         for child_index, child in enumerate(children):
             path = f"parents[{parent_index}].children[{child_index}]"
-            if not isinstance(child, Mapping):
-                raise TypeError(f"{path}はオブジェクトで指定してください。")
             child_title = _title(child, path)
             child_start, child_end = _schedule_dates(child, path)
             child_visible = _coerce_bool(child.get("visible", True))
@@ -184,7 +203,7 @@ def _normalize_rows(
                     start=child_start,
                     end=child_end,
                     effective_visible=effective_visible,
-                    progress=_progress(child, path),
+                    progress=child_progresses[child_index],
                     delay_days=max(0, (today - child_end).days),
                     hidden=not expanded,
                 )

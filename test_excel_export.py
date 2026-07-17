@@ -123,7 +123,10 @@ class ExcelExportTests(unittest.TestCase):
         self.assertEqual(self._cell_value(cells["A4"]), "└─ 子A-2")
         self.assertNotIn("親A", self._cell_value(cells["A3"]))
         self.assertEqual(self._cell_value(cells["A5"]), "▾ 親B")
-        self.assertEqual(float(self._cell_value(cells["E2"])), 0.5)
+        self.assertEqual(self._cell_value(cells["D2"]), "67%")
+        self.assertAlmostEqual(float(self._cell_value(cells["E2"])), 2 / 3)
+        self.assertEqual(self._cell_value(cells["D5"]), "100%")
+        self.assertEqual(float(self._cell_value(cells["E5"])), 1.0)
         self.assertEqual(int(self._cell_value(cells["F2"])), 2)
         self.assertEqual(int(self._cell_value(cells["G1"])), 46204)
 
