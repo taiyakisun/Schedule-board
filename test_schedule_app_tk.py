@@ -70,24 +70,38 @@ class ScheduleAppTkTests(unittest.TestCase):
         self.root.update()
 
     def test_theme_fonts_tree_and_row_dimensions(self) -> None:
+        self.assertEqual(self.root.title(), "Schedule-board")
         self.assertEqual(self.root.cget("bg").upper(), app_module.COLOR_APP_BG)
         self.assertEqual(self.app.style.theme_use(), "clam")
         self.assertEqual(
             set(self.app.toolbar_buttons),
             {
-                app_module.TEXT_ADD_PARENT,
-                app_module.TEXT_ADD_CHILD,
-                app_module.TEXT_DELETE,
-                app_module.TEXT_UP,
-                app_module.TEXT_DOWN,
+                app_module.TEXT_ADD_MENU,
                 app_module.TEXT_MOVE_TO_TODO,
-                app_module.TEXT_SETTINGS,
-                app_module.TEXT_EXPORT_EXCEL,
-                app_module.TEXT_RELOAD_INCOMPLETE,
+                app_module.TEXT_DELETE,
+                app_module.TEXT_ORDER,
+                app_module.TEXT_MORE,
             },
         )
-        self.assertTrue(
-            all(isinstance(button, ttk.Button) for button in self.app.toolbar_buttons.values())
+        self.assertEqual(
+            sum(
+                isinstance(control, ttk.Menubutton)
+                for control in self.app.toolbar_buttons.values()
+            ),
+            3,
+        )
+        add_menu = self.app.toolbar_buttons[app_module.TEXT_ADD_MENU].menu
+        self.assertEqual(add_menu.entrycget(0, "label"), "親タスクを追加")
+        self.assertEqual(add_menu.entrycget(1, "label"), "子タスクを追加")
+        self.assertEqual(
+            len(
+                [
+                    control
+                    for control in self.app.todo_toolbar.winfo_children()
+                    if isinstance(control, (ttk.Button, ttk.Menubutton))
+                ]
+            ),
+            5,
         )
 
         task_font = self.app.task_font.actual()
@@ -111,6 +125,32 @@ class ScheduleAppTkTests(unittest.TestCase):
             self.assertEqual(row.task_frame.winfo_height(), self.app.row_content_height)
             self.assertEqual(row.gantt_canvas.winfo_height(), self.app.row_content_height)
             self.assertGreaterEqual(row.task_label.winfo_height(), self.app.task_font.metrics("linespace"))
+
+    def test_primary_navigation_uses_exclusive_tab_styling(self) -> None:
+        self.assertEqual(
+            self.app.schedule_tab_indicator.cget("bg").upper(),
+            app_module.COLOR_PRIMARY,
+        )
+        self.assertEqual(
+            self.app.todo_tab_indicator.cget("bg").upper(),
+            app_module.COLOR_HEADER,
+        )
+        self.assertTrue(self.app.schedule_toolbar.winfo_ismapped())
+        self.assertFalse(self.app.todo_toolbar.winfo_ismapped())
+
+        self.app._switch_mode("todo")
+        self._pump()
+
+        self.assertEqual(
+            self.app.schedule_tab_indicator.cget("bg").upper(),
+            app_module.COLOR_HEADER,
+        )
+        self.assertEqual(
+            self.app.todo_tab_indicator.cget("bg").upper(),
+            app_module.COLOR_PRIMARY,
+        )
+        self.assertFalse(self.app.schedule_toolbar.winfo_ismapped())
+        self.assertTrue(self.app.todo_toolbar.winfo_ismapped())
 
     def test_columns_selection_and_collapse_stay_aligned(self) -> None:
         for width in (1050, 1280, 1600):
@@ -239,6 +279,7 @@ class ScheduleAppTkTests(unittest.TestCase):
             "親TODO",
             "2026-07-20",
             entry_id="todo-parent",
+            notify=True,
         )
         parent["children"].append(
             new_todo_entry(

@@ -48,7 +48,7 @@ def resource_path(*parts: str) -> str:
 DATA_FILE = os.path.join(application_directory(), "schedules.json")
 COMPLETE_LOG_FILE = os.path.join(application_directory(), "completed_tasks.jsonl")
 
-TITLE_APP = "Schedule-board（ガントチャート）"
+TITLE_APP = "Schedule-board"
 LABEL_VISIBILITY = "表示"
 LABEL_TASK = "タスク"
 LABEL_PROGRESS = "進捗度"
@@ -68,6 +68,9 @@ TEXT_RELOAD_INCOMPLETE = "未完了タスクの再読み込み"
 TEXT_MOVE_TO_TODO = "TODOへ移動"
 TEXT_MOVE_TO_SCHEDULE = "タスクへ移動"
 TEXT_SETTINGS = "表示設定"
+TEXT_ADD_MENU = "追加"
+TEXT_ORDER = "並べ替え"
+TEXT_MORE = "その他"
 VISIBLE_TEXT = "表示"
 HIDDEN_TEXT = "非表示"
 PARENT_HIDDEN_TEXT = "親非表示"
@@ -554,6 +557,42 @@ class ScheduleApp:
             bordercolor=[("focus", COLOR_PRIMARY), ("active", COLOR_BORDER)],
         )
         self.style.configure(
+            "Primary.TMenubutton",
+            background=COLOR_PRIMARY,
+            foreground="white",
+            bordercolor=COLOR_PRIMARY,
+            lightcolor=COLOR_PRIMARY,
+            darkcolor=COLOR_PRIMARY,
+            borderwidth=1,
+            focusthickness=2,
+            focuscolor=COLOR_PRIMARY_HOVER,
+            padding=(14, 8),
+            font=self.button_font,
+        )
+        self.style.map(
+            "Primary.TMenubutton",
+            background=[("pressed", COLOR_PRIMARY_HOVER), ("active", COLOR_PRIMARY_HOVER)],
+            bordercolor=[("focus", COLOR_TEXT), ("pressed", COLOR_PRIMARY_HOVER)],
+        )
+        self.style.configure(
+            "Secondary.TMenubutton",
+            background=COLOR_SURFACE,
+            foreground=COLOR_TEXT,
+            bordercolor=COLOR_BORDER,
+            lightcolor=COLOR_BORDER,
+            darkcolor=COLOR_BORDER,
+            borderwidth=1,
+            focusthickness=2,
+            focuscolor=COLOR_PRIMARY,
+            padding=(12, 7),
+            font=self.button_font,
+        )
+        self.style.map(
+            "Secondary.TMenubutton",
+            background=[("pressed", COLOR_HEADER), ("active", COLOR_SURFACE_ALT)],
+            bordercolor=[("focus", COLOR_PRIMARY), ("active", COLOR_BORDER)],
+        )
+        self.style.configure(
             "Danger.TButton",
             background=COLOR_DANGER_SOFT,
             foreground=COLOR_DANGER,
@@ -984,24 +1023,52 @@ class ScheduleApp:
         topbar.columnconfigure(0, weight=1)
         tk.Frame(topbar, width=4, bg=COLOR_PRIMARY).place(x=0, y=0, relheight=1)
 
-        tabs_frame = tk.Frame(topbar, bg=COLOR_SURFACE)
-        tabs_frame.grid(row=0, column=0, sticky="w", padx=20, pady=(10, 6))
-        self.schedule_tab_button = ttk.Button(
-            tabs_frame,
-            text="タスク＆ガント",
-            command=lambda: self._switch_mode("schedule"),
-            style="Primary.TButton",
-            cursor="hand2",
+        self.tabs_frame = tk.Frame(
+            topbar,
+            bg=COLOR_HEADER,
+            highlightthickness=1,
+            highlightbackground=COLOR_BORDER_SOFT,
         )
-        self.schedule_tab_button.grid(row=0, column=0)
-        self.todo_tab_button = ttk.Button(
-            tabs_frame,
-            text="TODOリスト",
-            command=lambda: self._switch_mode("todo"),
-            style="Secondary.TButton",
-            cursor="hand2",
-        )
-        self.todo_tab_button.grid(row=0, column=1, padx=(8, 0))
+        self.tabs_frame.grid(row=0, column=0, sticky="w", padx=20, pady=(10, 0))
+
+        def create_tab(column: int, text: str, mode: str) -> tuple[tk.Frame, tk.Label, tk.Frame]:
+            frame = tk.Frame(self.tabs_frame, bg=COLOR_HEADER, cursor="hand2")
+            frame.grid(row=0, column=column, sticky="nsew")
+            label = tk.Label(
+                frame,
+                text=text,
+                bg=COLOR_HEADER,
+                fg=COLOR_TEXT_MUTED,
+                font=self.header_font,
+                padx=24,
+                pady=10,
+                cursor="hand2",
+                takefocus=True,
+            )
+            label.grid(row=0, column=0, sticky="nsew")
+            indicator = tk.Frame(frame, height=3, bg=COLOR_HEADER)
+            indicator.grid(row=1, column=0, sticky="ew")
+
+            def activate(_event: tk.Event | None = None) -> str | None:
+                self._switch_mode(mode)
+                return "break" if _event is not None else None
+
+            for widget in (frame, label, indicator):
+                widget.bind("<Button-1>", activate)
+            label.bind("<Return>", activate)
+            label.bind("<space>", activate)
+            return frame, label, indicator
+
+        (
+            self.schedule_tab_frame,
+            self.schedule_tab_button,
+            self.schedule_tab_indicator,
+        ) = create_tab(0, "タスク＆ガント", "schedule")
+        (
+            self.todo_tab_frame,
+            self.todo_tab_button,
+            self.todo_tab_indicator,
+        ) = create_tab(1, "TODOリスト", "todo")
 
         overview_frame = tk.Frame(topbar, bg=COLOR_SURFACE)
         overview_frame.grid(row=0, column=1, sticky="e", padx=20, pady=(8, 4))
@@ -1026,65 +1093,139 @@ class ScheduleApp:
         )
         self.today_label.grid(row=0, column=1, sticky="e", padx=(12, 0))
 
-        self.schedule_toolbar = tk.Frame(topbar, bg=COLOR_SURFACE)
-        self.schedule_toolbar.grid(row=1, column=0, columnspan=2, sticky="ew", padx=20, pady=(4, 10))
-        self.schedule_toolbar.columnconfigure(9, weight=1)
-        self.toolbar_buttons: dict[str, ttk.Button] = {}
+        ttk.Separator(topbar, orient="horizontal").grid(
+            row=1, column=0, columnspan=2, sticky="ew", padx=20, pady=(8, 0)
+        )
 
-        button_specs = (
-            (0, TEXT_ADD_PARENT, "＋ 親を追加", self._on_add_parent, "Primary.TButton"),
-            (1, TEXT_ADD_CHILD, "＋ 子を追加", self._on_add_child, "Secondary.TButton"),
-            (3, TEXT_MOVE_TO_TODO, "TODOへ移動", self._on_move_to_todo, "Secondary.TButton"),
-            (4, TEXT_UP, "↑", self._on_up, "Secondary.TButton"),
-            (5, TEXT_DOWN, "↓", self._on_down, "Secondary.TButton"),
-            (6, TEXT_DELETE, "削除", self._on_delete, "Danger.TButton"),
-            (10, TEXT_EXPORT_EXCEL, "Excel出力", self._on_export_excel, "Secondary.TButton"),
-            (
-                11,
-                TEXT_RELOAD_INCOMPLETE,
-                "↻ 未完了タスクを再読込",
-                self._on_reload_incomplete_tasks,
-                "Secondary.TButton",
-            ),
-            (12, TEXT_SETTINGS, "表示設定", self._open_settings_dialog, "Secondary.TButton"),
-        )
-        ttk.Separator(self.schedule_toolbar, orient="vertical").grid(
-            row=0, column=2, sticky="ns", padx=10, pady=2
-        )
-        for column, key, text, command, style_name in button_specs:
-            button = ttk.Button(
-                self.schedule_toolbar,
+        def create_menu_button(
+            parent: tk.Frame,
+            text: str,
+            items: tuple[tuple[str, object | None], ...],
+            style: str,
+        ) -> ttk.Menubutton:
+            menu = tk.Menu(parent, tearoff=False)
+            for item_text, command in items:
+                if command is None:
+                    menu.add_separator()
+                else:
+                    menu.add_command(label=item_text, command=command)
+            button = ttk.Menubutton(
+                parent,
                 text=text,
-                command=command,
-                style=style_name,
+                menu=menu,
+                style=style,
                 cursor="hand2",
             )
-            button.grid(row=0, column=column, sticky="w", padx=(0, 7))
-            self.toolbar_buttons[key] = button
+            button.menu = menu
+            return button
+
+        self.schedule_toolbar = tk.Frame(topbar, bg=COLOR_SURFACE)
+        self.schedule_toolbar.grid(
+            row=2, column=0, columnspan=2, sticky="ew", padx=20, pady=(10, 10)
+        )
+        self.toolbar_buttons: dict[str, tk.Widget] = {}
+        schedule_add = create_menu_button(
+            self.schedule_toolbar,
+            "＋ 追加",
+            (
+                ("親タスクを追加", self._on_add_parent),
+                ("子タスクを追加", self._on_add_child),
+            ),
+            "Primary.TMenubutton",
+        )
+        schedule_move = ttk.Button(
+            self.schedule_toolbar,
+            text="TODOへ移動",
+            command=self._on_move_to_todo,
+            style="Secondary.TButton",
+            cursor="hand2",
+        )
+        schedule_delete = ttk.Button(
+            self.schedule_toolbar,
+            text="削除",
+            command=self._on_delete,
+            style="Danger.TButton",
+            cursor="hand2",
+        )
+        schedule_order = create_menu_button(
+            self.schedule_toolbar,
+            "並べ替え",
+            (("↑ 上へ", self._on_up), ("↓ 下へ", self._on_down)),
+            "Secondary.TMenubutton",
+        )
+        schedule_more = create_menu_button(
+            self.schedule_toolbar,
+            "その他",
+            (
+                ("Excel出力", self._on_export_excel),
+                ("未完了タスクを再読込", self._on_reload_incomplete_tasks),
+                ("", None),
+                ("表示設定", self._open_settings_dialog),
+            ),
+            "Secondary.TMenubutton",
+        )
+        schedule_controls = (
+            (TEXT_ADD_MENU, schedule_add),
+            (TEXT_MOVE_TO_TODO, schedule_move),
+            (TEXT_DELETE, schedule_delete),
+            (TEXT_ORDER, schedule_order),
+            (TEXT_MORE, schedule_more),
+        )
+        for column, (key, control) in enumerate(schedule_controls):
+            control.grid(
+                row=0,
+                column=column,
+                sticky="w",
+                padx=(0, 14 if column == 0 else 7),
+            )
+            self.toolbar_buttons[key] = control
 
         self.todo_toolbar = tk.Frame(topbar, bg=COLOR_SURFACE)
-        self.todo_toolbar.columnconfigure(8, weight=1)
-        todo_button_specs = (
-            (0, "todo_add", "＋ TODO追加", self._on_add_todo, "Primary.TButton"),
-            (1, "todo_add_child", "＋ 子TODO", self._on_add_child_todo, "Secondary.TButton"),
-            (3, TEXT_MOVE_TO_SCHEDULE, "タスクへ移動", self._on_move_to_schedule, "Secondary.TButton"),
-            (4, "todo_up", "↑", lambda: self._move_selected_todo(-1), "Secondary.TButton"),
-            (5, "todo_down", "↓", lambda: self._move_selected_todo(1), "Secondary.TButton"),
-            (6, "todo_delete", "削除", self._on_delete_todo, "Danger.TButton"),
-            (9, TEXT_SETTINGS, "表示設定", self._open_settings_dialog, "Secondary.TButton"),
+        todo_add = create_menu_button(
+            self.todo_toolbar,
+            "＋ 追加",
+            (("親TODOを追加", self._on_add_todo), ("子TODOを追加", self._on_add_child_todo)),
+            "Primary.TMenubutton",
         )
-        ttk.Separator(self.todo_toolbar, orient="vertical").grid(
-            row=0, column=2, sticky="ns", padx=10, pady=2
+        todo_move = ttk.Button(
+            self.todo_toolbar,
+            text="タスクへ移動",
+            command=self._on_move_to_schedule,
+            style="Secondary.TButton",
+            cursor="hand2",
         )
-        for column, key, text, command, style_name in todo_button_specs:
-            button = ttk.Button(
-                self.todo_toolbar,
-                text=text,
-                command=command,
-                style=style_name,
-                cursor="hand2",
+        todo_delete = ttk.Button(
+            self.todo_toolbar,
+            text="削除",
+            command=self._on_delete_todo,
+            style="Danger.TButton",
+            cursor="hand2",
+        )
+        todo_order = create_menu_button(
+            self.todo_toolbar,
+            "並べ替え",
+            (
+                ("↑ 上へ", lambda: self._move_selected_todo(-1)),
+                ("↓ 下へ", lambda: self._move_selected_todo(1)),
+            ),
+            "Secondary.TMenubutton",
+        )
+        todo_settings = ttk.Button(
+            self.todo_toolbar,
+            text="表示設定",
+            command=self._open_settings_dialog,
+            style="Secondary.TButton",
+            cursor="hand2",
+        )
+        for column, control in enumerate(
+            (todo_add, todo_move, todo_delete, todo_order, todo_settings)
+        ):
+            control.grid(
+                row=0,
+                column=column,
+                sticky="w",
+                padx=(0, 14 if column == 0 else 7),
             )
-            button.grid(row=0, column=column, sticky="w", padx=(0, 7))
 
         self.header = tk.Frame(
             self.root,
@@ -1181,6 +1322,7 @@ class ScheduleApp:
         self.rows_container.bind("<MouseWheel>", self._on_rows_mousewheel)
 
         self._build_todo_view()
+        self._switch_mode("schedule")
         self._apply_column_width()
 
     def _build_todo_view(self) -> None:
@@ -1254,12 +1396,27 @@ class ScheduleApp:
             return
         self.active_mode = mode
         schedule_active = mode == "schedule"
-        self.schedule_tab_button.configure(
-            style="Primary.TButton" if schedule_active else "Secondary.TButton"
-        )
-        self.todo_tab_button.configure(
-            style="Secondary.TButton" if schedule_active else "Primary.TButton"
-        )
+        for is_active, frame, label, indicator in (
+            (
+                schedule_active,
+                self.schedule_tab_frame,
+                self.schedule_tab_button,
+                self.schedule_tab_indicator,
+            ),
+            (
+                not schedule_active,
+                self.todo_tab_frame,
+                self.todo_tab_button,
+                self.todo_tab_indicator,
+            ),
+        ):
+            background = COLOR_SURFACE if is_active else COLOR_HEADER
+            frame.configure(bg=background)
+            label.configure(
+                bg=background,
+                fg=COLOR_PRIMARY if is_active else COLOR_TEXT_MUTED,
+            )
+            indicator.configure(bg=COLOR_PRIMARY if is_active else background)
         if schedule_active:
             self.todo_toolbar.grid_remove()
             self.todo_header.grid_remove()
@@ -1272,7 +1429,7 @@ class ScheduleApp:
             self.header.grid_remove()
             self.rows_shell.grid_remove()
             self.todo_toolbar.grid(
-                row=1, column=0, columnspan=2, sticky="ew", padx=20, pady=(4, 10)
+                row=2, column=0, columnspan=2, sticky="ew", padx=20, pady=(10, 10)
             )
             self.todo_header.grid()
             self.todo_rows_shell.grid()
@@ -1535,9 +1692,9 @@ class ScheduleApp:
         deadline_label.bind("<Double-1>", lambda _event, item_id=entry_id: self._on_edit_todo(item_id))
         notify_button = ttk.Button(
             row,
-            text="ON" if todo.get("notify", True) else "OFF",
+            text="ON" if todo.get("notify", False) else "OFF",
             width=7,
-            style="Success.TButton" if todo.get("notify", True) else "Secondary.TButton",
+            style="Success.TButton" if todo.get("notify", False) else "Secondary.TButton",
             command=lambda item_id=entry_id: self._toggle_todo_notification(item_id),
         )
         notify_button.grid(row=0, column=2, sticky="w", padx=(8, 12), pady=2)
@@ -1584,7 +1741,7 @@ class ScheduleApp:
         if location is None:
             return
         snapshot = self._snapshot_schedule()
-        location.entry["notify"] = not location.entry.get("notify", True)
+        location.entry["notify"] = not location.entry.get("notify", False)
         location.entry["last_notified_at"] = None
         self._save_or_restore(snapshot)
         self._rebuild_todo_rows()
@@ -2222,7 +2379,9 @@ class ScheduleApp:
             anchor="w",
         ).grid(row=0, column=0, sticky="ew", padx=24, pady=(20, 16))
         task_var = tk.StringVar(value=location.entry.get("task", "") if is_edit else "")
-        notify_var = tk.BooleanVar(value=location.entry.get("notify", True) if is_edit else True)
+        notify_var = tk.BooleanVar(
+            value=location.entry.get("notify", False) if is_edit else False
+        )
         tk.Label(
             content,
             text=LABEL_TASK_NAME,

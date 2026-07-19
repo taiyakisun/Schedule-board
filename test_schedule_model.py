@@ -368,7 +368,7 @@ class ScheduleModelTests(unittest.TestCase):
         self.assertEqual(todo["id"], "parent-1")
         self.assertEqual(todo["children"][0]["id"], "child-1")
         self.assertTrue(todo["collapsed"])
-        self.assertTrue(all(item["notify"] for item in iter_all_todos(schedule)))
+        self.assertFalse(any(item["notify"] for item in iter_all_todos(schedule)))
         todo["deadline"] = date(2026, 7, 10)
         serialized = serialize_schedule(schedule)
         restored_schedule = deserialize_schedule(serialized)
@@ -389,6 +389,7 @@ class ScheduleModelTests(unittest.TestCase):
             "2026-08-01",
             entry_id="todo-1",
         )
+        self.assertFalse(todo["notify"])
         schedule = {"version": 3, "parents": [], "todos": [todo]}
         restored = move_todo_group_to_schedule(schedule, "todo-1")
         self.assertEqual(restored["start"], date(2026, 8, 1))
@@ -396,13 +397,27 @@ class ScheduleModelTests(unittest.TestCase):
         self.assertEqual(restored["progress_value"], 0)
         self.assertIsNone(restored["started"])
 
+    def test_explicit_todo_notification_on_survives_round_trip(self) -> None:
+        todo = new_todo_entry(
+            KIND_PARENT,
+            "Notify",
+            "2026-08-01",
+            entry_id="todo-notify",
+            notify=True,
+        )
+        serialized = serialize_schedule(
+            {"version": 3, "parents": [], "todos": [todo]}
+        )
+        restored = deserialize_schedule(serialized)
+        self.assertTrue(restored["todos"][0]["notify"])
+
     def test_rejects_unknown_future_schedule_version(self) -> None:
         with self.assertRaises(ValueError):
             deserialize_schedule({"version": 99, "parents": []})
 
     def test_todo_notification_due_respects_deadline_switch_and_hour_interval(self) -> None:
         now = datetime(2026, 7, 20, 10, 0, tzinfo=timezone(timedelta(hours=9)))
-        todo = new_todo_entry(KIND_PARENT, "Due", "2026-07-20")
+        todo = new_todo_entry(KIND_PARENT, "Due", "2026-07-20", notify=True)
         self.assertTrue(todo_notification_due(todo, now))
         todo["last_notified_at"] = "2026-07-20T09:01:00+09:00"
         self.assertFalse(todo_notification_due(todo, now))

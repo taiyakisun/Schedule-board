@@ -12,6 +12,9 @@ from schedule_model import KIND_CHILD, KIND_PARENT, new_entry, progress_ratio, p
 
 
 class ApplicationResourceTests(unittest.TestCase):
+    def test_application_title_is_product_name_only(self) -> None:
+        self.assertEqual(app_module.TITLE_APP, "Schedule-board")
+
     def test_windows_notification_is_safely_disabled_on_other_platforms(self) -> None:
         with patch.object(app_module.sys, "platform", "linux"):
             self.assertFalse(app_module.show_windows_notification(Mock(), "title", "message"))
@@ -674,7 +677,7 @@ class ScheduleAppLogicTests(unittest.TestCase):
         self.assertEqual(app.selected_id, child_a["id"])
         app._switch_mode.assert_not_called()
 
-    def test_move_to_todo_succeeds_with_default_notifications(self) -> None:
+    def test_move_to_todo_succeeds_with_default_notifications_off(self) -> None:
         parent, child_a, _child_b = self.make_hierarchy()
         app = self.make_app([parent])
         app.schedule["todos"] = []
@@ -691,8 +694,8 @@ class ScheduleAppLogicTests(unittest.TestCase):
 
         self.assertEqual(app.entries, [])
         self.assertEqual(app.todos[0]["id"], parent["id"])
-        self.assertTrue(app.todos[0]["notify"])
-        self.assertTrue(all(child["notify"] for child in app.todos[0]["children"]))
+        self.assertFalse(app.todos[0]["notify"])
+        self.assertFalse(any(child["notify"] for child in app.todos[0]["children"]))
         app._switch_mode.assert_called_once_with("todo")
 
 

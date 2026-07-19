@@ -191,7 +191,7 @@ def new_todo_entry(
     *,
     parent_id: str | None = None,
     entry_id: str | None = None,
-    notify: bool = True,
+    notify: bool = False,
     last_notified_at: str | None = None,
     collapsed: bool = False,
     source: dict | None = None,
@@ -233,7 +233,7 @@ def _deserialize_todos(raw: object, used_ids: set[str]) -> list[dict]:
             raw_parent.get("task", ""),
             raw_parent["deadline"],
             entry_id=parent_id,
-            notify=raw_parent.get("notify", True),
+            notify=raw_parent.get("notify", False),
             last_notified_at=raw_parent.get("last_notified_at"),
             collapsed=raw_parent.get("collapsed", False),
             source=raw_parent.get("source"),
@@ -256,7 +256,7 @@ def _deserialize_todos(raw: object, used_ids: set[str]) -> list[dict]:
                     raw_child["deadline"],
                     parent_id=parent_id,
                     entry_id=child_id,
-                    notify=raw_child.get("notify", True),
+                    notify=raw_child.get("notify", False),
                     last_notified_at=raw_child.get("last_notified_at"),
                     source=raw_child.get("source"),
                 )
@@ -274,7 +274,7 @@ def _serialize_todo(todo: dict) -> dict:
         "parent_id": parent_id,
         "task": str(todo.get("task", "")),
         "deadline": _parse_date(todo["deadline"]).isoformat(),
-        "notify": bool(todo.get("notify", True)),
+        "notify": bool(todo.get("notify", False)),
         "last_notified_at": (
             str(todo.get("last_notified_at"))
             if todo.get("last_notified_at")
@@ -616,7 +616,7 @@ def todo_notification_due(
     current_datetime: datetime,
     interval: timedelta = timedelta(hours=1),
 ) -> bool:
-    if not todo.get("notify", True):
+    if not todo.get("notify", False):
         return False
     if _parse_date(todo["deadline"]) > current_datetime.date():
         return False
@@ -680,7 +680,7 @@ def _entry_to_todo(entry: dict, kind: str, parent_id: str | None = None) -> dict
         entry["start"],
         parent_id=parent_id,
         entry_id=entry.get("id"),
-        notify=True,
+        notify=False,
         collapsed=entry.get("collapsed", False),
         source=_entry_source(entry),
     )
