@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 import sch_gantt_main as app_module
-from schedule_model import KIND_CHILD, KIND_PARENT, new_entry
+from schedule_model import KIND_CHILD, KIND_PARENT, new_entry, new_todo_entry
 
 
 class ScheduleAppTkTests(unittest.TestCase):
@@ -30,6 +30,7 @@ class ScheduleAppTkTests(unittest.TestCase):
             "2026-07-31",
             entry_id="parent-1",
             progress_value=45,
+            started="2026-07-14",
         )
         child_a = new_entry(
             KIND_CHILD,
@@ -53,8 +54,13 @@ class ScheduleAppTkTests(unittest.TestCase):
         self.parent = parent
         self.child_a = child_a
         self.child_b = child_b
-        self.app.schedule = {"version": 2, "parents": [parent]}
-        self.app.entries = self.app.schedule["parents"]
+        self.app.schedule = {
+            "version": 3,
+            "parents": [parent],
+            "todos": [],
+            "settings": {"row_height": 40},
+        }
+        self.app._ensure_schedule_defaults()
         self.app._save = Mock(return_value=True)
         self.app._rebuild_rows()
         self._pump()
@@ -74,6 +80,8 @@ class ScheduleAppTkTests(unittest.TestCase):
                 app_module.TEXT_DELETE,
                 app_module.TEXT_UP,
                 app_module.TEXT_DOWN,
+                app_module.TEXT_MOVE_TO_TODO,
+                app_module.TEXT_SETTINGS,
                 app_module.TEXT_EXPORT_EXCEL,
                 app_module.TEXT_RELOAD_INCOMPLETE,
             },
@@ -98,6 +106,7 @@ class ScheduleAppTkTests(unittest.TestCase):
         self.assertEqual([row.tree_indicator.cget("text") for row in rows], ["▼", "├─", "└─"])
         self.assertEqual(rows[0].task_label.cget("font"), str(self.app.parent_font))
         self.assertEqual(rows[1].task_label.cget("font"), str(self.app.task_font))
+        self.assertEqual(rows[0].started_label.cget("text"), "07/14")
         for row in rows:
             self.assertEqual(row.task_frame.winfo_height(), self.app.row_content_height)
             self.assertEqual(row.gantt_canvas.winfo_height(), self.app.row_content_height)
@@ -141,7 +150,7 @@ class ScheduleAppTkTests(unittest.TestCase):
         self.assertEqual(self.app.row_widgets[0].tree_indicator.cget("text"), "▶")
 
     def _row_splitter_x(self, widgets: app_module.RowWidgets) -> int:
-        column_box = widgets.container.grid_bbox(5, 0, 5, 0)
+        column_box = widgets.container.grid_bbox(6, 0, 6, 0)
         return widgets.container.winfo_rootx() + column_box[0]
 
     def test_scroll_range_and_modern_dialog(self) -> None:
@@ -156,8 +165,8 @@ class ScheduleAppTkTests(unittest.TestCase):
                     entry_id=f"parent-{index + 10}",
                 )
             )
-        self.app.schedule = {"version": 2, "parents": parents}
-        self.app.entries = parents
+        self.app.schedule = {"version": 3, "parents": parents, "todos": []}
+        self.app._ensure_schedule_defaults()
         self.app._rebuild_rows()
         self._pump()
 
@@ -178,6 +187,10 @@ class ScheduleAppTkTests(unittest.TestCase):
         self.assertEqual(str(dialog.transient()), str(self.root))
         self.assertTrue(self._descendants_of_type(dialog, ttk.Entry))
         self.assertTrue(self._descendants_of_type(dialog, ttk.Radiobutton))
+        date_inputs = self._descendants_of_type(dialog, app_module.DateInput)
+        self.assertEqual(len(date_inputs), 3)
+        date_inputs[2].set_date(None)
+        self.assertIsNone(date_inputs[2].get_date(required=False))
         primary_buttons = [
             button
             for button in self._descendants_of_type(dialog, ttk.Button)
@@ -219,6 +232,40 @@ class ScheduleAppTkTests(unittest.TestCase):
             if "<lambda>" in command or "refresh_progress_mode" in command
         ]
         self.assertEqual(leaked_callbacks, [])
+
+    def test_todo_tab_displays_hierarchy_and_notification_state(self) -> None:
+        parent = new_todo_entry(
+            KIND_PARENT,
+            "親TODO",
+            "2026-07-20",
+            entry_id="todo-parent",
+        )
+        parent["children"].append(
+            new_todo_entry(
+                KIND_CHILD,
+                "子TODO",
+                "2026-07-21",
+                parent_id=parent["id"],
+                entry_id="todo-child",
+                notify=False,
+            )
+        )
+        self.app.schedule["todos"] = [parent]
+        self.app._ensure_schedule_defaults()
+        self.app._rebuild_todo_rows()
+        self.app._switch_mode("todo")
+        self._pump()
+
+        self.assertEqual(
+            [row.task_label.cget("text") for row in self.app.todo_row_widgets],
+            ["親TODO", "子TODO"],
+        )
+        self.assertEqual(
+            [row.notify_button.cget("text") for row in self.app.todo_row_widgets],
+            ["ON", "OFF"],
+        )
+        self.assertTrue(self.app.todo_header.winfo_ismapped())
+        self.assertFalse(self.app.header.winfo_ismapped())
 
     def _descendants_of_type(self, widget: tk.Misc, widget_type: type) -> list:
         matches = []

@@ -25,6 +25,7 @@ class ExcelExportTests(unittest.TestCase):
                 "task": "親A",
                 "start": "2026-07-01",
                 "end": "2026-07-03",
+                "started": "2026-07-02",
                 "visible": True,
                 "collapsed": True,
                 "progress_mode": "percent",
@@ -87,20 +88,20 @@ class ExcelExportTests(unittest.TestCase):
             sheet = ET.fromstring(archive.read("xl/worksheets/sheet1.xml"))
             styles = ET.fromstring(archive.read("xl/styles.xml"))
 
-        self.assertEqual(sheet.find("m:dimension", NS).get("ref"), "A1:L6")
+        self.assertEqual(sheet.find("m:dimension", NS).get("ref"), "A1:M6")
         pane = sheet.find("m:sheetViews/m:sheetView/m:pane", NS)
-        self.assertEqual(pane.get("xSplit"), "6")
+        self.assertEqual(pane.get("xSplit"), "7")
         self.assertEqual(pane.get("ySplit"), "1")
-        self.assertEqual(pane.get("topLeftCell"), "G2")
+        self.assertEqual(pane.get("topLeftCell"), "H2")
         self.assertEqual(pane.get("state"), "frozen")
-        self.assertEqual(sheet.find("m:autoFilter", NS).get("ref"), "A1:L6")
+        self.assertEqual(sheet.find("m:autoFilter", NS).get("ref"), "A1:M6")
 
         columns = sheet.findall("m:cols/m:col", NS)
         columns_by_index = {column.get("min"): column for column in columns}
         self.assertEqual(columns_by_index["1"].get("width"), "40")
-        self.assertEqual(columns_by_index["4"].get("width"), "8")
-        date_columns = columns_by_index["7"]
-        self.assertEqual(date_columns.get("max"), "12")
+        self.assertEqual(columns_by_index["4"].get("width"), "10")
+        date_columns = columns_by_index["8"]
+        self.assertEqual(date_columns.get("max"), "13")
         self.assertEqual(date_columns.get("width"), "4.2")
 
         rows = {int(row.get("r")): row for row in sheet.findall("m:sheetData/m:row", NS)}
@@ -116,28 +117,29 @@ class ExcelExportTests(unittest.TestCase):
             for row in rows.values()
             for cell in row.findall("m:c", NS)
         }
-        self.assertEqual(tuple(self._cell_value(cells[f"{column}1"]) for column in "ABCDEF"), HEADERS)
+        self.assertEqual(tuple(self._cell_value(cells[f"{column}1"]) for column in "ABCDEFG"), HEADERS)
         self.assertNotIn("表示状態", HEADERS)
         self.assertEqual(self._cell_value(cells["A2"]), "▸ 親A")
         self.assertEqual(self._cell_value(cells["A3"]), "├─ 子A-1")
         self.assertEqual(self._cell_value(cells["A4"]), "└─ 子A-2")
         self.assertNotIn("親A", self._cell_value(cells["A3"]))
         self.assertEqual(self._cell_value(cells["A5"]), "▾ 親B")
-        self.assertEqual(self._cell_value(cells["D2"]), "67%")
-        self.assertAlmostEqual(float(self._cell_value(cells["E2"])), 2 / 3)
-        self.assertEqual(self._cell_value(cells["D5"]), "100%")
-        self.assertEqual(float(self._cell_value(cells["E5"])), 1.0)
-        self.assertEqual(int(self._cell_value(cells["F2"])), 2)
-        self.assertEqual(int(self._cell_value(cells["G1"])), 46204)
+        self.assertEqual(int(self._cell_value(cells["D2"])), 46205)
+        self.assertEqual(self._cell_value(cells["E2"]), "67%")
+        self.assertAlmostEqual(float(self._cell_value(cells["F2"])), 2 / 3)
+        self.assertEqual(self._cell_value(cells["E5"]), "100%")
+        self.assertEqual(float(self._cell_value(cells["F5"])), 1.0)
+        self.assertEqual(int(self._cell_value(cells["G2"])), 2)
+        self.assertEqual(int(self._cell_value(cells["H1"])), 46204)
 
-        self.assertEqual(self._fill_color(cells["G2"], styles), "FF2E7D32")
         self.assertEqual(self._fill_color(cells["H2"], styles), "FF2E7D32")
-        self.assertEqual(self._fill_color(cells["I2"], styles), "FFA5D6A7")
-        self.assertEqual(self._fill_color(cells["H3"], styles), "FF2E7D32")
-        self.assertEqual(self._fill_color(cells["I3"], styles), "FFA5D6A7")
-        self.assertNotIn("G4", cells)
-        self.assertNotIn("K5", cells)
-        self.assertNotIn("K6", cells)
+        self.assertEqual(self._fill_color(cells["I2"], styles), "FF2E7D32")
+        self.assertEqual(self._fill_color(cells["J2"], styles), "FFA5D6A7")
+        self.assertEqual(self._fill_color(cells["I3"], styles), "FF2E7D32")
+        self.assertEqual(self._fill_color(cells["J3"], styles), "FFA5D6A7")
+        self.assertNotIn("H4", cells)
+        self.assertNotIn("L5", cells)
+        self.assertNotIn("L6", cells)
 
         cell_xfs = styles.find("m:cellXfs", NS)
         parent_title_xf = cell_xfs[int(cells["A2"].get("s"))]
@@ -152,8 +154,8 @@ class ExcelExportTests(unittest.TestCase):
 
         with zipfile.ZipFile(self.output) as archive:
             sheet = ET.fromstring(archive.read("xl/worksheets/sheet1.xml"))
-        self.assertEqual(sheet.find("m:dimension", NS).get("ref"), "A1:F1")
-        self.assertEqual(sheet.find("m:autoFilter", NS).get("ref"), "A1:F1")
+        self.assertEqual(sheet.find("m:dimension", NS).get("ref"), "A1:G1")
+        self.assertEqual(sheet.find("m:autoFilter", NS).get("ref"), "A1:G1")
         self.assertEqual(len(sheet.findall("m:sheetData/m:row", NS)), 1)
 
     def test_expands_row_height_for_wrapped_tree_title(self) -> None:

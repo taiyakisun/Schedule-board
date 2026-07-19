@@ -1,4 +1,5 @@
 import copy
+import ctypes
 import json
 import math
 import os
@@ -9,17 +10,27 @@ import tkinter as tk
 from tkinter import filedialog, font as tkfont, messagebox, ttk
 
 from excel_export import export_to_excel
+from date_widgets import DateInput
 from schedule_model import (
     delay_days,
     deserialize_schedule,
     find_entry,
+    find_todo,
+    iter_all_todos,
     iter_all_entries,
     move_entry,
+    move_schedule_group_to_todos,
+    move_todo,
+    move_todo_group_to_schedule,
     new_entry,
+    new_todo_entry,
     progress_ratio,
     progress_text,
     remove_entry,
+    remove_todo,
     serialize_schedule,
+    started_date_for_progress,
+    todo_notification_due,
 )
 
 
@@ -41,9 +52,11 @@ TITLE_APP = "Schedule-board（ガントチャート）"
 LABEL_VISIBILITY = "表示"
 LABEL_TASK = "タスク"
 LABEL_PROGRESS = "進捗度"
+LABEL_STARTED = "着手日"
 LABEL_DELAY = "遅延日数"
 LABEL_COMPLETE = "完了"
-LABEL_GANTT = "ガントチャート"
+LABEL_DEADLINE = "期限"
+LABEL_NOTIFICATION = "通知"
 TEXT_ADD_PARENT = "親を追加"
 TEXT_ADD_CHILD = "子を追加"
 TEXT_DELETE = "削除"
@@ -52,6 +65,9 @@ TEXT_DOWN = "下へ"
 TEXT_COMPLETE = "完了"
 TEXT_EXPORT_EXCEL = "Excel出力"
 TEXT_RELOAD_INCOMPLETE = "未完了タスクの再読み込み"
+TEXT_MOVE_TO_TODO = "TODOへ移動"
+TEXT_MOVE_TO_SCHEDULE = "タスクへ移動"
+TEXT_SETTINGS = "表示設定"
 VISIBLE_TEXT = "表示"
 HIDDEN_TEXT = "非表示"
 PARENT_HIDDEN_TEXT = "親非表示"
@@ -62,11 +78,13 @@ TEXT_CHILD = "子"
 TEXT_PERCENT_MODE = "0～100%"
 TEXT_VALUE_MODE = "指定数値"
 COMPLETE_BUTTON_WIDTH = 8
-ROW_CONTENT_MIN_HEIGHT = 40
+ROW_CONTENT_MIN_HEIGHT = 30
+ROW_CONTENT_DEFAULT_HEIGHT = 40
 VISIBILITY_COLUMN_WIDTH = 82
 PROGRESS_COLUMN_MIN_WIDTH = 78
 PROGRESS_COLUMN_MAX_WIDTH = 220
 PROGRESS_COLUMN_PADDING = 16
+STARTED_COLUMN_WIDTH = 62
 
 DIALOG_ADD_PARENT_TITLE = "親スケジュール追加"
 DIALOG_ADD_CHILD_TITLE = "子スケジュール追加"
@@ -74,6 +92,7 @@ DIALOG_EDIT_TITLE = "スケジュール編集"
 LABEL_TASK_NAME = "タスク名"
 LABEL_START_DATE = "開始日 (YYYY-MM-DD)"
 LABEL_END_DATE = "終了日 (YYYY-MM-DD)"
+LABEL_STARTED_DATE = "着手日（未着手は空欄）"
 LABEL_PROGRESS_MODE = "進捗の単位"
 LABEL_PROGRESS_VALUE = "現在の進捗"
 LABEL_PROGRESS_TOTAL = "分母"
@@ -100,6 +119,7 @@ INFO_DATA_RECOVERED_TITLE = "データを復旧しました"
 INFO_DATA_RECOVERED = "保存ファイルに問題があったため、直前の正常なデータから復旧しました。"
 WARNING_SELECT_PARENT_TITLE = "親の選択が必要です"
 WARNING_SELECT_PARENT_MESSAGE = "子を追加する親、またはその親に属する子を選択してください。"
+WARNING_SELECT_TODO_PARENT_MESSAGE = "子TODOを追加する親TODO、またはその子を選択してください。"
 
 CONFIRM_DELETE_TITLE = "削除確認"
 CONFIRM_DELETE_MESSAGE = "「{task}」を削除しますか？"
@@ -120,9 +140,12 @@ LOG_FIELD_VISIBLE = "表示"
 LOG_FIELD_PROGRESS_MODE = "進捗モード"
 LOG_FIELD_PROGRESS_VALUE = "進捗値"
 LOG_FIELD_PROGRESS_TOTAL = "進捗分母"
+LOG_FIELD_STARTED = "着手日"
 
 JST = timezone(timedelta(hours=9))
 JST_MONITOR_MS = 30_000
+TODO_MONITOR_MS = 60_000
+TODO_NOTIFICATION_INTERVAL = timedelta(hours=1)
 
 COLOR_APP_BG = "#F7F7F5"
 COLOR_SURFACE = "#FFFFFF"
@@ -187,6 +210,76 @@ def format_date(value: date) -> str:
 
 def current_jst_timestamp() -> str:
     return datetime.now(JST).isoformat(timespec="seconds")
+
+
+def show_windows_notification(root: tk.Tk, title: str, message: str) -> bool:
+    """Display a Windows notification-area balloon without extra packages."""
+
+    if sys.platform != "win32":
+        return False
+    try:
+        from ctypes import wintypes
+
+        class Guid(ctypes.Structure):
+            _fields_ = (
+                ("Data1", wintypes.DWORD),
+                ("Data2", wintypes.WORD),
+                ("Data3", wintypes.WORD),
+                ("Data4", wintypes.BYTE * 8),
+            )
+
+        class NotifyIconData(ctypes.Structure):
+            _fields_ = (
+                ("cbSize", wintypes.DWORD),
+                ("hWnd", wintypes.HWND),
+                ("uID", wintypes.UINT),
+                ("uFlags", wintypes.UINT),
+                ("uCallbackMessage", wintypes.UINT),
+                ("hIcon", wintypes.HANDLE),
+                ("szTip", wintypes.WCHAR * 128),
+                ("dwState", wintypes.DWORD),
+                ("dwStateMask", wintypes.DWORD),
+                ("szInfo", wintypes.WCHAR * 256),
+                ("uTimeoutOrVersion", wintypes.UINT),
+                ("szInfoTitle", wintypes.WCHAR * 64),
+                ("dwInfoFlags", wintypes.DWORD),
+                ("guidItem", Guid),
+                ("hBalloonIcon", wintypes.HANDLE),
+            )
+
+        shell_notify = ctypes.windll.shell32.Shell_NotifyIconW
+        shell_notify.restype = wintypes.BOOL
+        user32 = ctypes.windll.user32
+        user32.SendMessageW.restype = ctypes.c_ssize_t
+        hwnd = int(root.winfo_id())
+        icon = user32.SendMessageW(hwnd, 0x007F, 0, 0)
+        if not icon:
+            user32.LoadIconW.restype = wintypes.HANDLE
+            icon = user32.LoadIconW(None, ctypes.c_void_p(32516))
+
+        data = NotifyIconData()
+        data.cbSize = ctypes.sizeof(NotifyIconData)
+        data.hWnd = hwnd
+        data.uID = 0x5342
+        data.uFlags = 0x00000002 | 0x00000004 | 0x00000010
+        data.hIcon = icon
+        data.szTip = "Schedule-board"
+        data.szInfo = message[:255]
+        data.szInfoTitle = title[:63]
+        data.dwInfoFlags = 0x00000001
+        if not shell_notify(0x00000000, ctypes.byref(data)):
+            return False
+        data.uTimeoutOrVersion = 4
+        shell_notify(0x00000004, ctypes.byref(data))
+        root.after(
+            15_000,
+            lambda icon_data=data: shell_notify(
+                0x00000002, ctypes.byref(icon_data)
+            ),
+        )
+    except (AttributeError, OSError, tk.TclError):
+        return False
+    return True
 
 
 def entry_key(task: str, start: date, end: date) -> tuple[str, str, str, str]:
@@ -311,9 +404,22 @@ class RowWidgets:
     progress_frame: tk.Frame
     progress_label: tk.Label
     progress_canvas: tk.Canvas
+    started_label: tk.Label
     delay_label: tk.Label
     complete_button: ttk.Button
     gantt_canvas: tk.Canvas
+    base_bg: str
+
+
+@dataclass
+class TodoRowWidgets:
+    entry_id: str
+    container: tk.Frame
+    selection_bar: tk.Frame
+    tree_indicator: tk.Label
+    task_label: tk.Label
+    deadline_label: tk.Label
+    notify_button: ttk.Button
     base_bg: str
 
 
@@ -327,11 +433,20 @@ class ScheduleApp:
         initial_height = min(760, max(560, self.root.winfo_screenheight() - 160))
         self.root.geometry(f"{initial_width}x{initial_height}")
 
-        self.schedule: dict = {"version": 2, "parents": []}
+        self.schedule: dict = {
+            "version": 3,
+            "parents": [],
+            "todos": [],
+            "settings": {"row_height": ROW_CONTENT_DEFAULT_HEIGHT},
+        }
         self.entries: list[dict] = self.schedule["parents"]
+        self.todos: list[dict] = self.schedule["todos"]
         self.load_failed = False
         self.row_widgets: list[RowWidgets] = []
+        self.todo_row_widgets: list[TodoRowWidgets] = []
         self.selected_id: str | None = None
+        self.selected_todo_id: str | None = None
+        self.active_mode = "schedule"
 
         self.task_font = tkfont.nametofont("TkDefaultFont")
         self.task_font.configure(size=10)
@@ -348,11 +463,7 @@ class ScheduleApp:
         self.small_font = self.task_font.copy()
         self.small_font.configure(size=8)
         self._configure_theme()
-        self.row_content_height = max(
-            ROW_CONTENT_MIN_HEIGHT,
-            self.task_font.metrics("linespace") + 8,
-            self.parent_font.metrics("linespace") + 8,
-        )
+        self.row_content_height = ROW_CONTENT_DEFAULT_HEIGHT
         self.task_column_width = 320
         self.progress_column_width = PROGRESS_COLUMN_MIN_WIDTH
         self.delay_column_width = 76
@@ -365,11 +476,34 @@ class ScheduleApp:
 
         self._build_ui()
         self._load()
+        self._ensure_schedule_defaults()
+        self.row_content_height = self._normalized_row_height(
+            self.schedule["settings"].get("row_height", ROW_CONTENT_DEFAULT_HEIGHT)
+        )
         self._update_initial_task_width()
         self._rebuild_rows()
+        self._rebuild_todo_rows()
         self.root.after(100, self._redraw_scale)
         self.root.after(100, self._redraw_all_gantt)
         self.root.after(JST_MONITOR_MS, self._monitor_jst_date)
+        self.root.after(5_000, self._check_todo_notifications)
+
+    def _normalized_row_height(self, value: object) -> int:
+        try:
+            requested = int(value)
+        except (TypeError, ValueError):
+            requested = ROW_CONTENT_DEFAULT_HEIGHT
+        font_minimum = max(
+            self.task_font.metrics("linespace") + 6,
+            self.parent_font.metrics("linespace") + 6,
+        )
+        return max(ROW_CONTENT_MIN_HEIGHT, font_minimum, min(72, requested))
+
+    def _ensure_schedule_defaults(self) -> None:
+        self.schedule.setdefault("todos", [])
+        self.schedule.setdefault("settings", {"row_height": ROW_CONTENT_DEFAULT_HEIGHT})
+        self.entries = self.schedule["parents"]
+        self.todos = self.schedule["todos"]
 
     def _configure_theme(self) -> None:
         self.root.option_add("*Font", self.task_font)
@@ -504,9 +638,32 @@ class ScheduleApp:
             if hasattr(self, "today_label"):
                 self.today_label.configure(text=latest.strftime("%Y年%m月%d日"))
             self._refresh_delay_labels()
+            self._rebuild_todo_rows()
             self._redraw_scale()
             self._redraw_all_gantt()
         self.root.after(JST_MONITOR_MS, self._monitor_jst_date)
+
+    def _check_todo_notifications(self) -> None:
+        now = datetime.now(JST)
+        due_todos = [
+            todo
+            for todo in iter_all_todos(self.schedule)
+            if todo_notification_due(todo, now, TODO_NOTIFICATION_INTERVAL)
+        ]
+        if due_todos:
+            preview = " / ".join(todo.get("task", "") for todo in due_todos[:3])
+            if len(due_todos) > 3:
+                preview += f" ほか{len(due_todos) - 3}件"
+            if show_windows_notification(
+                self.root,
+                f"期限が来たTODOが{len(due_todos)}件あります",
+                preview,
+            ):
+                snapshot = self._snapshot_schedule()
+                for todo in due_todos:
+                    todo["last_notified_at"] = now.isoformat(timespec="seconds")
+                self._save_or_restore(snapshot)
+        self.root.after(TODO_MONITOR_MS, self._check_todo_notifications)
 
     # ----- persistence -----
     def _load(self) -> None:
@@ -572,7 +729,7 @@ class ScheduleApp:
 
     def _restore_schedule(self, snapshot: dict) -> None:
         self.schedule = snapshot
-        self.entries = self.schedule["parents"]
+        self._ensure_schedule_defaults()
 
     def _save_or_restore(self, snapshot: dict) -> bool:
         if self._save():
@@ -594,6 +751,9 @@ class ScheduleApp:
             LOG_FIELD_PROGRESS_MODE: entry.get("progress_mode", "percent"),
             LOG_FIELD_PROGRESS_VALUE: entry.get("progress_value", 0),
             LOG_FIELD_PROGRESS_TOTAL: entry.get("progress_total", 100),
+            LOG_FIELD_STARTED: (
+                format_date(entry["started"]) if entry.get("started") else None
+            ),
         }
 
     def _completion_journal_path(self) -> str:
@@ -820,39 +980,31 @@ class ScheduleApp:
             highlightthickness=1,
             highlightbackground=COLOR_BORDER_SOFT,
         )
-        topbar.grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 10))
+        topbar.grid(row=0, column=0, sticky="ew", padx=16, pady=(10, 8))
         topbar.columnconfigure(0, weight=1)
         tk.Frame(topbar, width=4, bg=COLOR_PRIMARY).place(x=0, y=0, relheight=1)
 
-        brand_frame = tk.Frame(topbar, bg=COLOR_SURFACE)
-        brand_frame.grid(row=0, column=0, sticky="w", padx=20, pady=(16, 8))
-        tk.Label(
-            brand_frame,
-            text="PROJECT TIMELINE",
-            bg=COLOR_SURFACE,
-            fg=COLOR_PRIMARY,
-            font=self.small_font,
-            anchor="w",
-        ).grid(row=0, column=0, sticky="w", pady=(0, 3))
-        tk.Label(
-            brand_frame,
-            text="Schedule-board",
-            bg=COLOR_SURFACE,
-            fg=COLOR_TEXT,
-            font=self.title_font,
-            anchor="w",
-        ).grid(row=1, column=0, sticky="w")
-        tk.Label(
-            brand_frame,
-            text="タスクと進捗を、ひとつのタイムラインで管理",
-            bg=COLOR_SURFACE,
-            fg=COLOR_TEXT_MUTED,
-            font=self.subtitle_font,
-            anchor="w",
-        ).grid(row=2, column=0, sticky="w", pady=(2, 0))
+        tabs_frame = tk.Frame(topbar, bg=COLOR_SURFACE)
+        tabs_frame.grid(row=0, column=0, sticky="w", padx=20, pady=(10, 6))
+        self.schedule_tab_button = ttk.Button(
+            tabs_frame,
+            text="タスク＆ガント",
+            command=lambda: self._switch_mode("schedule"),
+            style="Primary.TButton",
+            cursor="hand2",
+        )
+        self.schedule_tab_button.grid(row=0, column=0)
+        self.todo_tab_button = ttk.Button(
+            tabs_frame,
+            text="TODOリスト",
+            command=lambda: self._switch_mode("todo"),
+            style="Secondary.TButton",
+            cursor="hand2",
+        )
+        self.todo_tab_button.grid(row=0, column=1, padx=(8, 0))
 
         overview_frame = tk.Frame(topbar, bg=COLOR_SURFACE)
-        overview_frame.grid(row=0, column=1, sticky="e", padx=20, pady=(16, 8))
+        overview_frame.grid(row=0, column=1, sticky="e", padx=20, pady=(8, 4))
         self.summary_label = tk.Label(
             overview_frame,
             text="0グループ  •  0タスク",
@@ -872,34 +1024,36 @@ class ScheduleApp:
             padx=8,
             pady=3,
         )
-        self.today_label.grid(row=1, column=0, sticky="e", pady=(6, 0))
+        self.today_label.grid(row=0, column=1, sticky="e", padx=(12, 0))
 
-        button_frame = tk.Frame(topbar, bg=COLOR_SURFACE)
-        button_frame.grid(row=1, column=0, columnspan=2, sticky="ew", padx=20, pady=(4, 16))
-        button_frame.columnconfigure(6, weight=1)
+        self.schedule_toolbar = tk.Frame(topbar, bg=COLOR_SURFACE)
+        self.schedule_toolbar.grid(row=1, column=0, columnspan=2, sticky="ew", padx=20, pady=(4, 10))
+        self.schedule_toolbar.columnconfigure(9, weight=1)
         self.toolbar_buttons: dict[str, ttk.Button] = {}
 
         button_specs = (
             (0, TEXT_ADD_PARENT, "＋ 親を追加", self._on_add_parent, "Primary.TButton"),
             (1, TEXT_ADD_CHILD, "＋ 子を追加", self._on_add_child, "Secondary.TButton"),
-            (3, TEXT_UP, "↑ 上へ", self._on_up, "Secondary.TButton"),
-            (4, TEXT_DOWN, "↓ 下へ", self._on_down, "Secondary.TButton"),
-            (5, TEXT_DELETE, "削除", self._on_delete, "Danger.TButton"),
-            (7, TEXT_EXPORT_EXCEL, "Excel出力", self._on_export_excel, "Secondary.TButton"),
+            (3, TEXT_MOVE_TO_TODO, "TODOへ移動", self._on_move_to_todo, "Secondary.TButton"),
+            (4, TEXT_UP, "↑", self._on_up, "Secondary.TButton"),
+            (5, TEXT_DOWN, "↓", self._on_down, "Secondary.TButton"),
+            (6, TEXT_DELETE, "削除", self._on_delete, "Danger.TButton"),
+            (10, TEXT_EXPORT_EXCEL, "Excel出力", self._on_export_excel, "Secondary.TButton"),
             (
-                8,
+                11,
                 TEXT_RELOAD_INCOMPLETE,
                 "↻ 未完了タスクを再読込",
                 self._on_reload_incomplete_tasks,
                 "Secondary.TButton",
             ),
+            (12, TEXT_SETTINGS, "表示設定", self._open_settings_dialog, "Secondary.TButton"),
         )
-        ttk.Separator(button_frame, orient="vertical").grid(
+        ttk.Separator(self.schedule_toolbar, orient="vertical").grid(
             row=0, column=2, sticky="ns", padx=10, pady=2
         )
         for column, key, text, command, style_name in button_specs:
             button = ttk.Button(
-                button_frame,
+                self.schedule_toolbar,
                 text=text,
                 command=command,
                 style=style_name,
@@ -908,6 +1062,30 @@ class ScheduleApp:
             button.grid(row=0, column=column, sticky="w", padx=(0, 7))
             self.toolbar_buttons[key] = button
 
+        self.todo_toolbar = tk.Frame(topbar, bg=COLOR_SURFACE)
+        self.todo_toolbar.columnconfigure(8, weight=1)
+        todo_button_specs = (
+            (0, "todo_add", "＋ TODO追加", self._on_add_todo, "Primary.TButton"),
+            (1, "todo_add_child", "＋ 子TODO", self._on_add_child_todo, "Secondary.TButton"),
+            (3, TEXT_MOVE_TO_SCHEDULE, "タスクへ移動", self._on_move_to_schedule, "Secondary.TButton"),
+            (4, "todo_up", "↑", lambda: self._move_selected_todo(-1), "Secondary.TButton"),
+            (5, "todo_down", "↓", lambda: self._move_selected_todo(1), "Secondary.TButton"),
+            (6, "todo_delete", "削除", self._on_delete_todo, "Danger.TButton"),
+            (9, TEXT_SETTINGS, "表示設定", self._open_settings_dialog, "Secondary.TButton"),
+        )
+        ttk.Separator(self.todo_toolbar, orient="vertical").grid(
+            row=0, column=2, sticky="ns", padx=10, pady=2
+        )
+        for column, key, text, command, style_name in todo_button_specs:
+            button = ttk.Button(
+                self.todo_toolbar,
+                text=text,
+                command=command,
+                style=style_name,
+                cursor="hand2",
+            )
+            button.grid(row=0, column=column, sticky="w", padx=(0, 7))
+
         self.header = tk.Frame(
             self.root,
             bg=COLOR_HEADER,
@@ -915,17 +1093,17 @@ class ScheduleApp:
             highlightbackground=COLOR_BORDER_SOFT,
         )
         self.header.grid(row=1, column=0, sticky="ew", padx=(16, 16))
-        for column in range(7):
-            self.header.columnconfigure(column, weight=1 if column == 6 else 0)
+        for column in range(8):
+            self.header.columnconfigure(column, weight=1 if column == 7 else 0)
 
         self.header_labels: dict[str, tk.Label] = {}
         header_specs = (
             (0, LABEL_VISIBILITY, 8, (12, 8)),
             (1, LABEL_TASK, None, (0, 8)),
             (2, LABEL_PROGRESS, None, (0, 8)),
-            (3, LABEL_DELAY, None, (0, 8)),
-            (4, LABEL_COMPLETE, None, (0, 8)),
-            (6, LABEL_GANTT, None, (8, 8)),
+            (3, LABEL_STARTED, None, (0, 8)),
+            (4, LABEL_DELAY, None, (0, 8)),
+            (5, LABEL_COMPLETE, None, (0, 8)),
         )
         for column, text, width, padding in header_specs:
             label = tk.Label(
@@ -940,7 +1118,7 @@ class ScheduleApp:
             label.grid(
                 row=0,
                 column=column,
-                rowspan=1 if column == 6 else 2,
+                rowspan=2,
                 sticky="nsew",
                 padx=padding,
                 pady=(10, 6),
@@ -950,11 +1128,11 @@ class ScheduleApp:
 
         self.scale_canvas = tk.Canvas(
             self.header,
-            height=58,
+            height=50,
             highlightthickness=0,
             background=COLOR_HEADER,
         )
-        self.scale_canvas.grid(row=1, column=6, sticky="ew", padx=(0, 4))
+        self.scale_canvas.grid(row=0, column=7, rowspan=2, sticky="ew", padx=(0, 4))
         self.scale_canvas.bind("<Configure>", lambda _event: self._redraw_scale())
 
         self.splitter = tk.Frame(
@@ -963,29 +1141,29 @@ class ScheduleApp:
             cursor="sb_h_double_arrow",
             bg=COLOR_BORDER_SOFT,
         )
-        self.splitter.grid(row=0, column=5, rowspan=2, sticky="ns")
+        self.splitter.grid(row=0, column=6, rowspan=2, sticky="ns")
         self.splitter.bind("<Button-1>", self._on_splitter_press)
         self.splitter.bind("<B1-Motion>", self._on_splitter_drag)
         self.splitter.bind("<ButtonRelease-1>", self._on_splitter_release)
 
-        rows_shell = tk.Frame(
+        self.rows_shell = tk.Frame(
             self.root,
             bg=COLOR_SURFACE,
             highlightthickness=1,
             highlightbackground=COLOR_BORDER_SOFT,
         )
-        rows_shell.grid(row=2, column=0, sticky="nsew", padx=16, pady=(0, 16))
-        rows_shell.columnconfigure(0, weight=1)
-        rows_shell.rowconfigure(0, weight=1)
+        self.rows_shell.grid(row=2, column=0, sticky="nsew", padx=16, pady=(0, 10))
+        self.rows_shell.columnconfigure(0, weight=1)
+        self.rows_shell.rowconfigure(0, weight=1)
 
         self.rows_canvas = tk.Canvas(
-            rows_shell,
+            self.rows_shell,
             highlightthickness=0,
             background=COLOR_SURFACE,
         )
         self.rows_canvas.grid(row=0, column=0, sticky="nsew")
         self.rows_scrollbar = ttk.Scrollbar(
-            rows_shell,
+            self.rows_shell,
             orient="vertical",
             command=self.rows_canvas.yview,
             style="Modern.Vertical.TScrollbar",
@@ -1002,7 +1180,108 @@ class ScheduleApp:
         self.rows_canvas.bind("<MouseWheel>", self._on_rows_mousewheel)
         self.rows_container.bind("<MouseWheel>", self._on_rows_mousewheel)
 
+        self._build_todo_view()
         self._apply_column_width()
+
+    def _build_todo_view(self) -> None:
+        self.todo_header = tk.Frame(
+            self.root,
+            bg=COLOR_HEADER,
+            highlightthickness=1,
+            highlightbackground=COLOR_BORDER_SOFT,
+        )
+        self.todo_header.grid(row=1, column=0, sticky="ew", padx=16)
+        self.todo_header.columnconfigure(0, weight=1)
+        self.todo_header.columnconfigure(1, minsize=120)
+        self.todo_header.columnconfigure(2, minsize=110)
+        for column, text in enumerate((LABEL_TASK, LABEL_DEADLINE, LABEL_NOTIFICATION)):
+            tk.Label(
+                self.todo_header,
+                text=text,
+                anchor="w",
+                bg=COLOR_HEADER,
+                fg=COLOR_TEXT_MUTED,
+                font=self.header_font,
+            ).grid(row=0, column=column, sticky="ew", padx=(16, 8), pady=10)
+
+        self.todo_rows_shell = tk.Frame(
+            self.root,
+            bg=COLOR_SURFACE,
+            highlightthickness=1,
+            highlightbackground=COLOR_BORDER_SOFT,
+        )
+        self.todo_rows_shell.grid(row=2, column=0, sticky="nsew", padx=16, pady=(0, 10))
+        self.todo_rows_shell.columnconfigure(0, weight=1)
+        self.todo_rows_shell.rowconfigure(0, weight=1)
+        self.todo_rows_canvas = tk.Canvas(
+            self.todo_rows_shell,
+            highlightthickness=0,
+            background=COLOR_SURFACE,
+        )
+        self.todo_rows_canvas.grid(row=0, column=0, sticky="nsew")
+        self.todo_rows_scrollbar = ttk.Scrollbar(
+            self.todo_rows_shell,
+            orient="vertical",
+            command=self.todo_rows_canvas.yview,
+            style="Modern.Vertical.TScrollbar",
+        )
+        self.todo_rows_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.todo_rows_canvas.configure(yscrollcommand=self.todo_rows_scrollbar.set)
+        self.todo_rows_container = tk.Frame(self.todo_rows_canvas, bg=COLOR_SURFACE)
+        self.todo_rows_window = self.todo_rows_canvas.create_window(
+            (0, 0), window=self.todo_rows_container, anchor="nw"
+        )
+        self.todo_rows_container.columnconfigure(0, weight=1)
+        self.todo_rows_container.bind(
+            "<Configure>",
+            lambda _event: self.todo_rows_canvas.configure(
+                scrollregion=self.todo_rows_canvas.bbox("all")
+            ),
+        )
+        self.todo_rows_canvas.bind(
+            "<Configure>",
+            lambda event: self.todo_rows_canvas.itemconfigure(
+                self.todo_rows_window, width=event.width
+            ),
+        )
+        self.todo_rows_canvas.bind("<MouseWheel>", self._on_todo_mousewheel)
+        self.todo_rows_container.bind("<MouseWheel>", self._on_todo_mousewheel)
+        self.todo_header.grid_remove()
+        self.todo_rows_shell.grid_remove()
+
+    def _switch_mode(self, mode: str) -> None:
+        if mode not in ("schedule", "todo"):
+            return
+        self.active_mode = mode
+        schedule_active = mode == "schedule"
+        self.schedule_tab_button.configure(
+            style="Primary.TButton" if schedule_active else "Secondary.TButton"
+        )
+        self.todo_tab_button.configure(
+            style="Secondary.TButton" if schedule_active else "Primary.TButton"
+        )
+        if schedule_active:
+            self.todo_toolbar.grid_remove()
+            self.todo_header.grid_remove()
+            self.todo_rows_shell.grid_remove()
+            self.schedule_toolbar.grid()
+            self.header.grid()
+            self.rows_shell.grid()
+        else:
+            self.schedule_toolbar.grid_remove()
+            self.header.grid_remove()
+            self.rows_shell.grid_remove()
+            self.todo_toolbar.grid(
+                row=1, column=0, columnspan=2, sticky="ew", padx=20, pady=(4, 10)
+            )
+            self.todo_header.grid()
+            self.todo_rows_shell.grid()
+        self._update_summary_label()
+
+    def _on_todo_mousewheel(self, event: tk.Event) -> str:
+        if event.delta:
+            self.todo_rows_canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+        return "break"
 
     def _on_rows_mousewheel(self, event: tk.Event) -> str:
         if event.delta:
@@ -1021,15 +1300,17 @@ class ScheduleApp:
         self.header.columnconfigure(0, minsize=VISIBILITY_COLUMN_WIDTH)
         self.header.columnconfigure(1, minsize=self.task_column_width + 8)
         self.header.columnconfigure(2, minsize=self.progress_column_width)
-        self.header.columnconfigure(3, minsize=self.delay_column_width)
-        self.header.columnconfigure(4, minsize=self.complete_column_width + 8)
+        self.header.columnconfigure(3, minsize=STARTED_COLUMN_WIDTH)
+        self.header.columnconfigure(4, minsize=self.delay_column_width)
+        self.header.columnconfigure(5, minsize=self.complete_column_width + 8)
         for widgets in self.row_widgets:
             row = widgets.container
             row.columnconfigure(0, minsize=VISIBILITY_COLUMN_WIDTH)
             row.columnconfigure(1, minsize=self.task_column_width)
             row.columnconfigure(2, minsize=self.progress_column_width)
-            row.columnconfigure(3, minsize=self.delay_column_width)
-            row.columnconfigure(4, minsize=self.complete_column_width)
+            row.columnconfigure(3, minsize=STARTED_COLUMN_WIDTH)
+            row.columnconfigure(4, minsize=self.delay_column_width)
+            row.columnconfigure(5, minsize=self.complete_column_width)
             widgets.task_frame.configure(width=self.task_column_width, height=self.row_content_height)
             widgets.task_frame.grid_propagate(False)
 
@@ -1097,6 +1378,17 @@ class ScheduleApp:
     def _update_summary_label(self) -> None:
         if not hasattr(self, "summary_label"):
             return
+        if getattr(self, "active_mode", "schedule") == "todo":
+            todo_count = len(list(iter_all_todos(self.schedule)))
+            due_count = sum(
+                1
+                for todo in iter_all_todos(self.schedule)
+                if todo.get("deadline") <= self.current_jst_date
+            )
+            self.summary_label.configure(
+                text=f"{todo_count}件のTODO  ·  期限到来 {due_count}件"
+            )
+            return
         parent_count = len(self.entries)
         tasks = list(iter_all_entries(self.schedule))
         task_count = len(tasks)
@@ -1141,6 +1433,162 @@ class ScheduleApp:
             font=self.subtitle_font,
         ).grid(row=2, column=0, pady=(6, 0))
 
+    def _display_todo_items(self) -> list[tuple[dict, dict]]:
+        rows: list[tuple[dict, dict]] = []
+        for parent in self.schedule.get("todos", []):
+            rows.append((parent, parent))
+            if not parent.get("collapsed", False):
+                rows.extend((child, parent) for child in parent.get("children", []))
+        return rows
+
+    def _clear_todo_rows(self) -> None:
+        if not hasattr(self, "todo_rows_container"):
+            return
+        for child in self.todo_rows_container.winfo_children():
+            child.destroy()
+        self.todo_row_widgets.clear()
+
+    def _rebuild_todo_rows(self) -> None:
+        if not hasattr(self, "todo_rows_container"):
+            return
+        self._clear_todo_rows()
+        items = self._display_todo_items()
+        for row_index, (todo, parent) in enumerate(items):
+            self._add_todo_row(row_index, todo, parent)
+        if not items:
+            empty = tk.Label(
+                self.todo_rows_container,
+                text="TODOはありません。「TODO追加」またはタスク画面の「TODOへ移動」から追加できます。",
+                bg=COLOR_SURFACE,
+                fg=COLOR_TEXT_MUTED,
+                font=self.subtitle_font,
+                pady=60,
+            )
+            empty.grid(row=0, column=0, sticky="ew")
+        self._refresh_todo_selection()
+        self._update_summary_label()
+
+    def _add_todo_row(self, row_index: int, todo: dict, parent: dict) -> None:
+        entry_id = todo["id"]
+        is_child = todo.get("kind") == "child"
+        base_bg = COLOR_SURFACE_ALT if row_index % 2 else COLOR_SURFACE
+        row = tk.Frame(self.todo_rows_container, bg=base_bg, height=self.row_content_height)
+        row.grid(row=row_index, column=0, sticky="ew")
+        row.columnconfigure(0, weight=1)
+        row.columnconfigure(1, minsize=120)
+        row.columnconfigure(2, minsize=110)
+        row.grid_propagate(False)
+        row.bind("<Button-1>", lambda _event, item_id=entry_id: self._select_todo(item_id))
+        row.bind("<MouseWheel>", self._on_todo_mousewheel)
+        selection_bar = tk.Frame(row, width=4, bg=base_bg)
+        selection_bar.place(x=0, y=0, relheight=1)
+
+        task_frame = tk.Frame(row, bg=base_bg)
+        task_frame.grid(row=0, column=0, sticky="nsew", padx=(12, 8), pady=2)
+        task_frame.columnconfigure(1, weight=1)
+        if is_child:
+            children = parent.get("children", [])
+            indicator_text = "└─" if children and children[-1]["id"] == entry_id else "├─"
+        else:
+            indicator_text = (
+                TEXT_EXPAND if todo.get("collapsed", False) else TEXT_COLLAPSE
+            ) if todo.get("children") else "•"
+        indicator = tk.Label(
+            task_frame,
+            text=indicator_text,
+            width=3,
+            anchor="center",
+            bg=base_bg,
+            fg=COLOR_PRIMARY if todo.get("children") else COLOR_BORDER,
+            font=self.header_font,
+            cursor="hand2" if todo.get("children") else "arrow",
+        )
+        indicator.grid(row=0, column=0, padx=(18 if is_child else 0, 4))
+        if todo.get("children"):
+            indicator.bind(
+                "<Button-1>",
+                lambda _event, item_id=entry_id: self._toggle_todo_collapsed(item_id),
+            )
+        task_label = tk.Label(
+            task_frame,
+            text=todo.get("task", ""),
+            anchor="w",
+            bg=base_bg,
+            fg=COLOR_TEXT,
+            font=self.task_font if is_child else self.parent_font,
+        )
+        task_label.grid(row=0, column=1, sticky="nsew")
+        task_label.bind("<Button-1>", lambda _event, item_id=entry_id: self._select_todo(item_id))
+        task_label.bind("<Double-1>", lambda _event, item_id=entry_id: self._on_edit_todo(item_id))
+
+        deadline = todo.get("deadline")
+        deadline_label = tk.Label(
+            row,
+            text=deadline.strftime("%Y-%m-%d") if isinstance(deadline, date) else "",
+            anchor="w",
+            bg=base_bg,
+            fg=COLOR_DANGER if isinstance(deadline, date) and deadline <= self.current_jst_date else COLOR_TEXT,
+            font=self.small_font,
+        )
+        deadline_label.grid(row=0, column=1, sticky="ew", padx=(8, 8))
+        deadline_label.bind("<Button-1>", lambda _event, item_id=entry_id: self._select_todo(item_id))
+        deadline_label.bind("<Double-1>", lambda _event, item_id=entry_id: self._on_edit_todo(item_id))
+        notify_button = ttk.Button(
+            row,
+            text="ON" if todo.get("notify", True) else "OFF",
+            width=7,
+            style="Success.TButton" if todo.get("notify", True) else "Secondary.TButton",
+            command=lambda item_id=entry_id: self._toggle_todo_notification(item_id),
+        )
+        notify_button.grid(row=0, column=2, sticky="w", padx=(8, 12), pady=2)
+        self.todo_row_widgets.append(
+            TodoRowWidgets(
+                entry_id,
+                row,
+                selection_bar,
+                indicator,
+                task_label,
+                deadline_label,
+                notify_button,
+                base_bg,
+            )
+        )
+
+    def _select_todo(self, entry_id: str) -> None:
+        if find_todo(self.schedule, entry_id) is None:
+            return
+        self.selected_todo_id = entry_id
+        self._refresh_todo_selection()
+
+    def _refresh_todo_selection(self) -> None:
+        for widgets in self.todo_row_widgets:
+            selected = widgets.entry_id == self.selected_todo_id
+            bg = COLOR_PRIMARY_SOFT if selected else widgets.base_bg
+            widgets.container.configure(bg=bg)
+            widgets.selection_bar.configure(bg=COLOR_PRIMARY if selected else bg)
+            widgets.tree_indicator.configure(bg=bg)
+            widgets.task_label.configure(bg=bg)
+            widgets.deadline_label.configure(bg=bg)
+
+    def _toggle_todo_collapsed(self, entry_id: str) -> None:
+        location = find_todo(self.schedule, entry_id)
+        if location is None or not location.is_parent:
+            return
+        snapshot = self._snapshot_schedule()
+        location.entry["collapsed"] = not location.entry.get("collapsed", False)
+        self._save_or_restore(snapshot)
+        self._rebuild_todo_rows()
+
+    def _toggle_todo_notification(self, entry_id: str) -> None:
+        location = find_todo(self.schedule, entry_id)
+        if location is None:
+            return
+        snapshot = self._snapshot_schedule()
+        location.entry["notify"] = not location.entry.get("notify", True)
+        location.entry["last_notified_at"] = None
+        self._save_or_restore(snapshot)
+        self._rebuild_todo_rows()
+
     def _add_row(self, row_index: int, entry: dict, parent: dict) -> None:
         entry_id = entry["id"]
         is_child = entry["kind"] == "child"
@@ -1148,11 +1596,13 @@ class ScheduleApp:
         row = tk.Frame(
             self.rows_container,
             bg=base_bg,
+            height=self.row_content_height,
             highlightthickness=0,
         )
         row.grid(row=row_index, column=0, sticky="ew")
-        for column in range(7):
-            row.columnconfigure(column, weight=1 if column == 6 else 0)
+        row.grid_propagate(False)
+        for column in range(8):
+            row.columnconfigure(column, weight=1 if column == 7 else 0)
         row.bind("<Button-1>", lambda _event, item_id=entry_id: self._select(item_id))
         row.bind("<MouseWheel>", self._on_rows_mousewheel)
 
@@ -1185,12 +1635,12 @@ class ScheduleApp:
             padx=4,
             pady=2,
         )
-        vis_label.grid(row=0, column=0, sticky="w", padx=(12, 8), pady=4)
+        vis_label.grid(row=0, column=0, sticky="w", padx=(12, 8))
         vis_label.bind("<Button-1>", lambda _event, item_id=entry_id: self._toggle_visibility(item_id))
         vis_label.bind("<MouseWheel>", self._on_rows_mousewheel)
 
         task_frame = tk.Frame(row, height=self.row_content_height, bg=base_bg)
-        task_frame.grid(row=0, column=1, sticky="nsew", padx=(0, 8), pady=4)
+        task_frame.grid(row=0, column=1, sticky="nsew", padx=(0, 8))
         task_frame.columnconfigure(1, weight=1)
         task_frame.grid_propagate(False)
         task_frame.bind("<Button-1>", lambda _event, item_id=entry_id: self._select(item_id))
@@ -1248,7 +1698,7 @@ class ScheduleApp:
         task_label.bind("<MouseWheel>", self._on_rows_mousewheel)
 
         progress_frame = tk.Frame(row, bg=base_bg, height=self.row_content_height)
-        progress_frame.grid(row=0, column=2, sticky="nsew", padx=(0, 12), pady=4)
+        progress_frame.grid(row=0, column=2, sticky="nsew", padx=(0, 12))
         progress_frame.columnconfigure(0, weight=1)
         progress_label = tk.Label(
             progress_frame,
@@ -1279,6 +1729,20 @@ class ScheduleApp:
         )
         progress_canvas.bind("<MouseWheel>", self._on_rows_mousewheel)
 
+        started = entry.get("started")
+        started_label = tk.Label(
+            row,
+            text=started.strftime("%m/%d") if isinstance(started, date) else "—",
+            anchor="w",
+            bg=base_bg,
+            fg=COLOR_TEXT if started else COLOR_TEXT_MUTED,
+            font=self.small_font,
+        )
+        started_label.grid(row=0, column=3, sticky="ew", padx=(0, 8))
+        started_label.bind("<Button-1>", lambda _event, item_id=entry_id: self._select(item_id))
+        started_label.bind("<Double-1>", lambda _event, item_id=entry_id: self._on_edit(item_id))
+        started_label.bind("<MouseWheel>", self._on_rows_mousewheel)
+
         delay_label = tk.Label(
             row,
             anchor="w",
@@ -1286,7 +1750,7 @@ class ScheduleApp:
             fg=COLOR_TEXT_MUTED,
             font=self.small_font,
         )
-        delay_label.grid(row=0, column=3, sticky="ew", padx=(0, 8), pady=4)
+        delay_label.grid(row=0, column=4, sticky="ew", padx=(0, 8))
         delay_label.bind("<Button-1>", lambda _event, item_id=entry_id: self._select(item_id))
         delay_label.bind("<MouseWheel>", self._on_rows_mousewheel)
 
@@ -1298,11 +1762,11 @@ class ScheduleApp:
             cursor="hand2",
             command=lambda item_id=entry_id: self._on_complete(item_id),
         )
-        complete_button.grid(row=0, column=4, sticky="w", padx=(0, 8), pady=4)
+        complete_button.grid(row=0, column=5, sticky="w", padx=(0, 8))
         complete_button.bind("<MouseWheel>", self._on_rows_mousewheel)
 
         tk.Frame(row, width=self.splitter_width, bg=COLOR_BORDER).grid(
-            row=0, column=5, sticky="ns"
+            row=0, column=6, sticky="ns"
         )
 
         gantt_canvas = tk.Canvas(
@@ -1311,7 +1775,7 @@ class ScheduleApp:
             background=base_bg,
             highlightthickness=0,
         )
-        gantt_canvas.grid(row=0, column=6, sticky="ew", padx=(0, 4), pady=4)
+        gantt_canvas.grid(row=0, column=7, sticky="ew", padx=(0, 4))
         gantt_canvas.bind("<Button-1>", lambda _event, item_id=entry_id: self._select(item_id))
         gantt_canvas.bind("<Configure>", lambda _event, item_id=entry_id: self._redraw_gantt_for(item_id))
         gantt_canvas.bind("<MouseWheel>", self._on_rows_mousewheel)
@@ -1328,6 +1792,7 @@ class ScheduleApp:
                 progress_frame,
                 progress_label,
                 progress_canvas,
+                started_label,
                 delay_label,
                 complete_button,
                 gantt_canvas,
@@ -1400,6 +1865,7 @@ class ScheduleApp:
             widgets.progress_frame.configure(bg=bg)
             widgets.progress_label.configure(bg=bg)
             widgets.progress_canvas.configure(bg=bg)
+            widgets.started_label.configure(bg=bg)
             widgets.delay_label.configure(bg=bg)
             widgets.gantt_canvas.configure(
                 bg=COLOR_SELECTED_GANTT if is_selected else widgets.base_bg
@@ -1466,6 +1932,111 @@ class ScheduleApp:
         if move_entry(self.schedule, self.selected_id, direction):
             self._save_or_restore(snapshot)
             self._rebuild_rows()
+
+    def _on_move_to_todo(self) -> None:
+        location = self._find(self.selected_id)
+        if location is None:
+            return
+        group = location.parent
+        if not messagebox.askyesno(
+            "TODOへ移動",
+            f"「{group['task']}」と配下の子タスク{len(group.get('children', []))}件をTODOへ移動しますか？",
+        ):
+            return
+        snapshot = self._snapshot_schedule()
+        moved = move_schedule_group_to_todos(self.schedule, group["id"])
+        if moved is None:
+            return
+        previous_selection = self.selected_id
+        self.selected_id = None
+        self.selected_todo_id = moved["id"]
+        if not self._save_or_restore(snapshot):
+            self.selected_id = previous_selection
+            self.selected_todo_id = None
+        self._rebuild_rows()
+        self._rebuild_todo_rows()
+        if self.selected_todo_id:
+            self._switch_mode("todo")
+
+    def _on_move_to_schedule(self) -> None:
+        location = find_todo(self.schedule, self.selected_todo_id or "")
+        if location is None:
+            return
+        group = location.parent
+        if not messagebox.askyesno(
+            "タスクへ移動",
+            f"「{group['task']}」と配下の子TODO {len(group.get('children', []))}件をタスクへ移動しますか？",
+        ):
+            return
+        snapshot = self._snapshot_schedule()
+        try:
+            moved = move_todo_group_to_schedule(self.schedule, group["id"])
+        except ValueError as exc:
+            messagebox.showerror(ERROR_INPUT_TITLE, str(exc))
+            return
+        if moved is None:
+            return
+        previous_selection = self.selected_todo_id
+        self.selected_todo_id = None
+        self.selected_id = moved["id"]
+        if not self._save_or_restore(snapshot):
+            self.selected_todo_id = previous_selection
+            self.selected_id = None
+        self._rebuild_todo_rows()
+        self._rebuild_rows()
+        if self.selected_id:
+            self._switch_mode("schedule")
+
+    def _on_add_todo(self) -> None:
+        self._open_todo_dialog("parent")
+
+    def _on_add_child_todo(self) -> None:
+        location = find_todo(self.schedule, self.selected_todo_id or "")
+        if location is None:
+            messagebox.showwarning(
+                WARNING_SELECT_PARENT_TITLE,
+                WARNING_SELECT_TODO_PARENT_MESSAGE,
+            )
+            return
+        self._open_todo_dialog("child", parent_id=location.parent["id"])
+
+    def _on_edit_todo(self, entry_id: str) -> None:
+        location = find_todo(self.schedule, entry_id)
+        if location is None:
+            return
+        self._open_todo_dialog(
+            location.entry.get("kind", "parent"),
+            parent_id=location.entry.get("parent_id"),
+            entry_id=entry_id,
+        )
+
+    def _on_delete_todo(self) -> None:
+        location = find_todo(self.schedule, self.selected_todo_id or "")
+        if location is None:
+            return
+        entry = location.entry
+        message = (
+            f"「{entry['task']}」と配下の子TODO {len(entry.get('children', []))}件を削除しますか？"
+            if location.is_parent
+            else f"「{entry['task']}」を削除しますか？"
+        )
+        if not messagebox.askyesno(CONFIRM_DELETE_TITLE, message):
+            return
+        snapshot = self._snapshot_schedule()
+        previous_selection = self.selected_todo_id
+        remove_todo(self.schedule, entry["id"])
+        self.selected_todo_id = None
+        if not self._save_or_restore(snapshot):
+            self.selected_todo_id = previous_selection
+        self._rebuild_todo_rows()
+
+    def _move_selected_todo(self, direction: int) -> None:
+        if not self.selected_todo_id:
+            return
+        snapshot = self._snapshot_schedule()
+        if move_todo(self.schedule, self.selected_todo_id, direction):
+            self._save_or_restore(snapshot)
+            self._rebuild_todo_rows()
 
     def _on_complete(self, entry_id: str) -> None:
         location = self._find(entry_id)
@@ -1558,6 +2129,7 @@ class ScheduleApp:
                 progress_mode=str(record.get(LOG_FIELD_PROGRESS_MODE, "percent")),
                 progress_value=record.get(LOG_FIELD_PROGRESS_VALUE, 0),
                 progress_total=record.get(LOG_FIELD_PROGRESS_TOTAL, 100),
+                started=record.get(LOG_FIELD_STARTED),
                 entry_id=record_id or None,
             )
             if requested_kind == "child":
@@ -1618,6 +2190,216 @@ class ScheduleApp:
         messagebox.showinfo(INFO_EXCEL_EXPORT_TITLE, INFO_EXCEL_EXPORT.format(path=output_path))
 
     # ----- dialog -----
+    def _open_todo_dialog(
+        self,
+        kind: str,
+        parent_id: str | None = None,
+        entry_id: str | None = None,
+    ) -> None:
+        location = find_todo(self.schedule, entry_id or "")
+        is_edit = location is not None
+        title = "TODO編集" if is_edit else ("子TODO追加" if kind == "child" else "TODO追加")
+        dlg = tk.Toplevel(self.root)
+        dlg.title(title)
+        dlg.configure(bg=COLOR_APP_BG)
+        dlg.transient(self.root)
+        dlg.grab_set()
+        dlg.resizable(False, False)
+        content = tk.Frame(
+            dlg,
+            bg=COLOR_SURFACE,
+            highlightthickness=1,
+            highlightbackground=COLOR_BORDER_SOFT,
+        )
+        content.grid(row=0, column=0, padx=16, pady=16)
+        content.columnconfigure(0, weight=1)
+        tk.Label(
+            content,
+            text=title,
+            bg=COLOR_SURFACE,
+            fg=COLOR_TEXT,
+            font=self.title_font,
+            anchor="w",
+        ).grid(row=0, column=0, sticky="ew", padx=24, pady=(20, 16))
+        task_var = tk.StringVar(value=location.entry.get("task", "") if is_edit else "")
+        notify_var = tk.BooleanVar(value=location.entry.get("notify", True) if is_edit else True)
+        tk.Label(
+            content,
+            text=LABEL_TASK_NAME,
+            bg=COLOR_SURFACE,
+            fg=COLOR_TEXT_MUTED,
+            font=self.header_font,
+            anchor="w",
+        ).grid(row=1, column=0, sticky="ew", padx=24, pady=(0, 6))
+        task_entry = ttk.Entry(content, textvariable=task_var, width=48, style="Modern.TEntry")
+        task_entry.grid(row=2, column=0, sticky="ew", padx=24, pady=(0, 14))
+        tk.Label(
+            content,
+            text=LABEL_DEADLINE,
+            bg=COLOR_SURFACE,
+            fg=COLOR_TEXT_MUTED,
+            font=self.header_font,
+            anchor="w",
+        ).grid(row=3, column=0, sticky="ew", padx=24, pady=(0, 6))
+        initial_deadline = location.entry.get("deadline") if is_edit else self.current_jst_date
+        deadline_input = DateInput(
+            content,
+            value=initial_deadline,
+            background=COLOR_SURFACE,
+        )
+        deadline_input.grid(row=4, column=0, sticky="ew", padx=24, pady=(0, 12))
+        ttk.Checkbutton(
+            content,
+            text="期限到来後、1時間ごとにWindows通知する",
+            variable=notify_var,
+        ).grid(row=5, column=0, sticky="w", padx=24)
+        footer = tk.Frame(content, bg=COLOR_SURFACE)
+        footer.grid(row=6, column=0, sticky="ew", padx=24, pady=(20, 20))
+        footer.columnconfigure(0, weight=1)
+
+        def close_dialog() -> None:
+            if dlg.grab_current() == dlg:
+                dlg.grab_release()
+            dlg.destroy()
+
+        def submit() -> None:
+            task_text = task_var.get().strip()
+            if not task_text:
+                messagebox.showerror(ERROR_INPUT_TITLE, ERROR_EMPTY_TASK)
+                return
+            try:
+                deadline = deadline_input.get_date()
+            except ValueError:
+                messagebox.showerror(ERROR_INPUT_TITLE, ERROR_INVALID_DATE)
+                return
+            snapshot = self._snapshot_schedule()
+            previous_selection = self.selected_todo_id
+            if is_edit:
+                current = find_todo(self.schedule, entry_id or "")
+                if current is None:
+                    return
+                current.entry.update(
+                    {
+                        "task": task_text,
+                        "deadline": deadline,
+                        "notify": notify_var.get(),
+                        "last_notified_at": None,
+                    }
+                )
+                target = current.entry
+            else:
+                target = new_todo_entry(
+                    kind,
+                    task_text,
+                    deadline,
+                    parent_id=parent_id,
+                    notify=notify_var.get(),
+                )
+                if kind == "parent":
+                    self.todos.append(target)
+                else:
+                    parent = find_todo(self.schedule, parent_id or "")
+                    if parent is None:
+                        messagebox.showerror(ERROR_INPUT_TITLE, WARNING_SELECT_TODO_PARENT_MESSAGE)
+                        return
+                    parent.entry.setdefault("children", []).append(target)
+                    parent.entry["collapsed"] = False
+            self.selected_todo_id = target["id"]
+            if not self._save_or_restore(snapshot):
+                self.selected_todo_id = previous_selection
+                self._rebuild_todo_rows()
+                return
+            self._rebuild_todo_rows()
+            close_dialog()
+
+        ttk.Button(
+            footer,
+            text=BUTTON_CANCEL,
+            command=close_dialog,
+            style="Secondary.TButton",
+        ).grid(row=0, column=1)
+        ttk.Button(
+            footer,
+            text=BUTTON_OK,
+            command=submit,
+            style="Primary.TButton",
+        ).grid(row=0, column=2, padx=(8, 0))
+        dlg.protocol("WM_DELETE_WINDOW", close_dialog)
+        dlg.bind("<Escape>", lambda _event: close_dialog())
+        dlg.bind("<Return>", lambda _event: submit())
+        task_entry.focus_set()
+
+    def _open_settings_dialog(self) -> None:
+        dlg = tk.Toplevel(self.root)
+        dlg.title("表示設定")
+        dlg.configure(bg=COLOR_APP_BG)
+        dlg.transient(self.root)
+        dlg.grab_set()
+        dlg.resizable(False, False)
+        frame = tk.Frame(dlg, bg=COLOR_SURFACE, padx=24, pady=20)
+        frame.grid(row=0, column=0)
+        tk.Label(
+            frame,
+            text="スケジュール行の高さ",
+            bg=COLOR_SURFACE,
+            fg=COLOR_TEXT,
+            font=self.header_font,
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        height_var = tk.IntVar(value=self.row_content_height)
+        tk.Scale(
+            frame,
+            from_=ROW_CONTENT_MIN_HEIGHT,
+            to=72,
+            orient="horizontal",
+            variable=height_var,
+            length=260,
+            resolution=1,
+            bg=COLOR_SURFACE,
+            highlightthickness=0,
+        ).grid(row=1, column=0, columnspan=2)
+        tk.Label(
+            frame,
+            text="30px（コンパクト）～72px（広め）",
+            bg=COLOR_SURFACE,
+            fg=COLOR_TEXT_MUTED,
+            font=self.small_font,
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(2, 16))
+
+        def close_dialog() -> None:
+            if dlg.grab_current() == dlg:
+                dlg.grab_release()
+            dlg.destroy()
+
+        def apply_setting() -> None:
+            snapshot = self._snapshot_schedule()
+            self.row_content_height = self._normalized_row_height(height_var.get())
+            self.schedule.setdefault("settings", {})["row_height"] = self.row_content_height
+            if not self._save_or_restore(snapshot):
+                self.row_content_height = self._normalized_row_height(
+                    self.schedule.get("settings", {}).get(
+                        "row_height", ROW_CONTENT_DEFAULT_HEIGHT
+                    )
+                )
+                return
+            self._rebuild_rows()
+            self._rebuild_todo_rows()
+            close_dialog()
+
+        ttk.Button(
+            frame,
+            text=BUTTON_CANCEL,
+            command=close_dialog,
+            style="Secondary.TButton",
+        ).grid(row=3, column=0, sticky="e")
+        ttk.Button(
+            frame,
+            text="適用",
+            command=apply_setting,
+            style="Primary.TButton",
+        ).grid(row=3, column=1, sticky="e", padx=(8, 0))
+        dlg.protocol("WM_DELETE_WINDOW", close_dialog)
+        dlg.bind("<Escape>", lambda _event: close_dialog())
+
     def _open_entry_dialog(
         self,
         kind: str,
@@ -1666,8 +2448,6 @@ class ScheduleApp:
         ).grid(row=1, column=0, sticky="ew", padx=24, pady=(0, 18))
 
         task_var = tk.StringVar()
-        start_var = tk.StringVar()
-        end_var = tk.StringVar()
         progress_mode_var = tk.StringVar(value="percent")
         progress_value_var = tk.StringVar(value="0")
         progress_total_var = tk.StringVar(value="100")
@@ -1675,15 +2455,17 @@ class ScheduleApp:
         if is_edit:
             entry = location.entry
             task_var.set(entry["task"])
-            start_var.set(format_date(entry["start"]))
-            end_var.set(format_date(entry["end"]))
+            initial_start = entry["start"]
+            initial_end = entry["end"]
+            initial_started = entry.get("started")
             progress_mode_var.set(entry.get("progress_mode", "percent"))
             progress_value_var.set(number_text(entry.get("progress_value", 0)))
             progress_total_var.set(number_text(entry.get("progress_total", 100)))
         else:
             today = self.current_jst_date
-            start_var.set(format_date(today))
-            end_var.set(format_date(today))
+            initial_start = today
+            initial_end = today
+            initial_started = None
 
         form = tk.Frame(content, bg=COLOR_SURFACE)
         form.grid(row=2, column=0, sticky="ew", padx=24)
@@ -1725,20 +2507,33 @@ class ScheduleApp:
             font=self.header_font,
             anchor="w",
         ).grid(row=0, column=1, sticky="ew", padx=(8, 0), pady=(0, 6))
-        start_entry = ttk.Entry(
+        start_input = DateInput(
             dates_frame,
-            textvariable=start_var,
-            width=20,
-            style="Modern.TEntry",
+            value=initial_start,
+            background=COLOR_SURFACE,
         )
-        end_entry = ttk.Entry(
+        end_input = DateInput(
             dates_frame,
-            textvariable=end_var,
-            width=20,
-            style="Modern.TEntry",
+            value=initial_end,
+            background=COLOR_SURFACE,
         )
-        start_entry.grid(row=1, column=0, sticky="ew", padx=(0, 8))
-        end_entry.grid(row=1, column=1, sticky="ew", padx=(8, 0))
+        start_input.grid(row=1, column=0, sticky="ew", padx=(0, 8))
+        end_input.grid(row=1, column=1, sticky="ew", padx=(8, 0))
+        tk.Label(
+            dates_frame,
+            text=LABEL_STARTED_DATE,
+            bg=COLOR_SURFACE,
+            fg=COLOR_TEXT_MUTED,
+            font=self.header_font,
+            anchor="w",
+        ).grid(row=2, column=0, columnspan=2, sticky="ew", pady=(12, 6))
+        started_input = DateInput(
+            dates_frame,
+            value=initial_started,
+            allow_empty=True,
+            background=COLOR_SURFACE,
+        )
+        started_input.grid(row=3, column=0, columnspan=2, sticky="ew")
 
         tk.Label(
             form,
@@ -1851,9 +2646,10 @@ class ScheduleApp:
                 messagebox.showerror(ERROR_INPUT_TITLE, ERROR_EMPTY_TASK)
                 return
             try:
-                start_value = parse_date(start_var.get())
-                end_value = parse_date(end_var.get())
-            except Exception:
+                start_value = start_input.get_date()
+                end_value = end_input.get_date()
+                started_value = started_input.get_date(required=False)
+            except ValueError:
                 messagebox.showerror(ERROR_INPUT_TITLE, ERROR_INVALID_DATE)
                 return
             if end_value < start_value:
@@ -1877,6 +2673,11 @@ class ScheduleApp:
 
             clean_value: int | float = int(progress_value) if progress_value.is_integer() else progress_value
             clean_total: int | float = int(progress_total) if progress_total.is_integer() else progress_total
+            started_value = started_date_for_progress(
+                started_value,
+                clean_value,
+                self.current_jst_date,
+            )
             snapshot = self._snapshot_schedule()
             previous_selection = self.selected_id
             if is_edit:
@@ -1893,6 +2694,7 @@ class ScheduleApp:
                         "progress_mode": progress_mode_var.get(),
                         "progress_value": clean_value,
                         "progress_total": clean_total,
+                        "started": started_value,
                     }
                 )
                 self.selected_id = target["id"]
@@ -1906,6 +2708,7 @@ class ScheduleApp:
                     progress_mode=progress_mode_var.get(),
                     progress_value=clean_value,
                     progress_total=clean_total,
+                    started=started_value,
                 )
                 if kind == "parent":
                     self.entries.append(target)

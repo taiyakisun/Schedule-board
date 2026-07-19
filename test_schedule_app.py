@@ -12,6 +12,36 @@ from schedule_model import KIND_CHILD, KIND_PARENT, new_entry, progress_ratio, p
 
 
 class ApplicationResourceTests(unittest.TestCase):
+    def test_windows_notification_is_safely_disabled_on_other_platforms(self) -> None:
+        with patch.object(app_module.sys, "platform", "linux"):
+            self.assertFalse(app_module.show_windows_notification(Mock(), "title", "message"))
+
+    def test_windows_notification_uses_notification_area_api(self) -> None:
+        shell_notify = Mock(return_value=True)
+        user32 = SimpleNamespace(
+            SendMessageW=Mock(return_value=123),
+            LoadIconW=Mock(return_value=456),
+        )
+        native = SimpleNamespace(
+            shell32=SimpleNamespace(Shell_NotifyIconW=shell_notify),
+            user32=user32,
+        )
+        root = Mock()
+        root.winfo_id.return_value = 99
+        with (
+            patch.object(app_module.sys, "platform", "win32"),
+            patch.object(app_module.ctypes, "windll", native),
+        ):
+            self.assertTrue(
+                app_module.show_windows_notification(root, "期限", "TODOがあります")
+            )
+
+        self.assertEqual(shell_notify.call_args_list[0].args[0], 0)
+        self.assertEqual(shell_notify.call_args_list[1].args[0], 4)
+        root.after.assert_called_once()
+        root.after.call_args.args[1]()
+        self.assertEqual(shell_notify.call_args_list[2].args[0], 2)
+
     def test_application_directory_uses_executable_when_frozen(self) -> None:
         executable = os.path.join("C:\\", "apps", "ScheduleBoard", "ScheduleBoard.exe")
         with (
@@ -127,7 +157,7 @@ class ScheduleAppLogicTests(unittest.TestCase):
 
             self.assertEqual(app.entries, [])
             self.assertIsNone(app.selected_id)
-            self.assertEqual(json.loads(data_file.read_text(encoding="utf-8")), {"version": 2, "parents": []})
+            self.assertEqual(json.loads(data_file.read_text(encoding="utf-8")), {"version": 3, "parents": []})
             app._rebuild_rows.assert_called_once_with()
             showerror.assert_not_called()
 
@@ -177,7 +207,7 @@ class ScheduleAppLogicTests(unittest.TestCase):
             )
             self.assertTrue(all(record[app_module.LOG_FIELD_COMPLETED] is True for record in records))
             self.assertEqual(app.entries, [])
-            self.assertEqual(json.loads(data_file.read_text(encoding="utf-8")), {"version": 2, "parents": []})
+            self.assertEqual(json.loads(data_file.read_text(encoding="utf-8")), {"version": 3, "parents": []})
             app._rebuild_rows.assert_called_once_with()
             showerror.assert_not_called()
 
@@ -222,7 +252,7 @@ class ScheduleAppLogicTests(unittest.TestCase):
         app._save.assert_called_once_with()
         app._rebuild_rows.assert_called_once_with()
 
-    def test_loads_legacy_v1_and_saves_version_2(self) -> None:
+    def test_loads_legacy_v1_and_saves_version_3(self) -> None:
         legacy = {
             "entries": [
                 {
@@ -246,7 +276,7 @@ class ScheduleAppLogicTests(unittest.TestCase):
                 app._save()
 
             saved = json.loads(data_file.read_text(encoding="utf-8"))
-            self.assertEqual(saved["version"], 2)
+            self.assertEqual(saved["version"], 3)
             self.assertNotIn("entries", saved)
             self.assertEqual(len(saved["parents"]), 1)
             self.assertEqual(saved["parents"][0]["task"], "Legacy task")
@@ -619,6 +649,51 @@ class ScheduleAppLogicTests(unittest.TestCase):
             len(progress_text(numeric)) * 10 + app_module.PROGRESS_COLUMN_PADDING,
         )
         self.assertEqual(app.progress_column_width, expected)
+
+    def test_move_to_todo_moves_the_whole_parent_group_and_rolls_back_on_save_failure(self) -> None:
+        parent, child_a, child_b = self.make_hierarchy()
+        app = self.make_app([parent])
+        app.schedule["todos"] = []
+        app.schedule["settings"] = {"row_height": 40}
+        app.todos = app.schedule["todos"]
+        app.selected_id = child_a["id"]
+        app.selected_todo_id = None
+        app._rebuild_todo_rows = Mock()
+        app._switch_mode = Mock()
+        app._save = Mock(return_value=False)
+
+        with (
+            patch.object(app_module.messagebox, "askyesno", return_value=True),
+            patch.object(app_module.messagebox, "showerror"),
+        ):
+            app._on_move_to_todo()
+
+        self.assertEqual([item["id"] for item in app.entries], [parent["id"]])
+        self.assertEqual([item["id"] for item in parent["children"]], [child_a["id"], child_b["id"]])
+        self.assertEqual(app.todos, [])
+        self.assertEqual(app.selected_id, child_a["id"])
+        app._switch_mode.assert_not_called()
+
+    def test_move_to_todo_succeeds_with_default_notifications(self) -> None:
+        parent, child_a, _child_b = self.make_hierarchy()
+        app = self.make_app([parent])
+        app.schedule["todos"] = []
+        app.schedule["settings"] = {"row_height": 40}
+        app.todos = app.schedule["todos"]
+        app.selected_id = child_a["id"]
+        app.selected_todo_id = None
+        app._rebuild_todo_rows = Mock()
+        app._switch_mode = Mock()
+        app._save = Mock(return_value=True)
+
+        with patch.object(app_module.messagebox, "askyesno", return_value=True):
+            app._on_move_to_todo()
+
+        self.assertEqual(app.entries, [])
+        self.assertEqual(app.todos[0]["id"], parent["id"])
+        self.assertTrue(app.todos[0]["notify"])
+        self.assertTrue(all(child["notify"] for child in app.todos[0]["children"]))
+        app._switch_mode.assert_called_once_with("todo")
 
 
 if __name__ == "__main__":

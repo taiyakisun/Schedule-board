@@ -1,5 +1,5 @@
 import unittest
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 
 from schedule_model import (
     KIND_CHILD,
@@ -10,13 +10,20 @@ from schedule_model import (
     deserialize_schedule,
     effective_visible,
     find_entry,
+    find_todo,
+    iter_all_todos,
     iter_all_entries,
     move_entry,
+    move_schedule_group_to_todos,
+    move_todo_group_to_schedule,
     new_entry,
+    new_todo_entry,
     progress_ratio,
     progress_text,
     remove_entry,
     serialize_schedule,
+    started_date_for_progress,
+    todo_notification_due,
     visible_rows,
 )
 
@@ -61,7 +68,7 @@ class ScheduleModelTests(unittest.TestCase):
         first = deserialize_schedule(legacy)
         second = deserialize_schedule(legacy)
 
-        self.assertEqual(first["version"], 2)
+        self.assertEqual(first["version"], 3)
         self.assertEqual([entry["id"] for entry in first["parents"]], [entry["id"] for entry in second["parents"]])
         self.assertEqual([entry["kind"] for entry in first["parents"]], [KIND_PARENT, KIND_PARENT])
         self.assertEqual([entry["parent_id"] for entry in first["parents"]], [None, None])
@@ -318,6 +325,94 @@ class ScheduleModelTests(unittest.TestCase):
         parent["children"].clear()
         self.assertEqual(progress_ratio(parent), 0.9)
         self.assertEqual(progress_text(parent), "9 / 10 (90%)")
+
+    def test_started_date_round_trip_and_automatic_first_progress(self) -> None:
+        parent = new_entry(
+            KIND_PARENT,
+            "Started",
+            "2026-07-01",
+            "2026-07-03",
+            started="2026-07-02",
+        )
+        serialized = serialize_schedule({"version": 3, "parents": [parent]})
+        self.assertEqual(serialized["parents"][0]["started"], "2026-07-02")
+        restored = deserialize_schedule(serialized)["parents"][0]
+        self.assertEqual(restored["started"], date(2026, 7, 2))
+        self.assertIsNone(started_date_for_progress(None, 0, "2026-07-14"))
+        self.assertEqual(
+            started_date_for_progress(None, 1, "2026-07-14"),
+            date(2026, 7, 14),
+        )
+        self.assertEqual(
+            started_date_for_progress("2026-07-02", 50, "2026-07-14"),
+            date(2026, 7, 2),
+        )
+
+    def test_parent_group_moves_to_todo_and_back_without_losing_hierarchy(self) -> None:
+        parent = self.make_parent("parent-1")
+        parent["started"] = date(2026, 7, 2)
+        parent["collapsed"] = True
+        child = self.make_child("child-1", "parent-1")
+        child["progress_value"] = 40
+        parent["children"].append(child)
+        schedule = {
+            "version": 3,
+            "parents": [parent],
+            "todos": [],
+            "settings": {"row_height": 34},
+        }
+
+        todo = move_schedule_group_to_todos(schedule, "child-1")
+
+        self.assertEqual(schedule["parents"], [])
+        self.assertEqual(todo["id"], "parent-1")
+        self.assertEqual(todo["children"][0]["id"], "child-1")
+        self.assertTrue(todo["collapsed"])
+        self.assertTrue(all(item["notify"] for item in iter_all_todos(schedule)))
+        todo["deadline"] = date(2026, 7, 10)
+        serialized = serialize_schedule(schedule)
+        restored_schedule = deserialize_schedule(serialized)
+        restored = move_todo_group_to_schedule(restored_schedule, "child-1")
+
+        self.assertEqual(restored["start"], date(2026, 7, 10))
+        self.assertEqual(restored["end"], date(2026, 7, 19))
+        self.assertEqual(restored["started"], date(2026, 7, 2))
+        self.assertTrue(restored["collapsed"])
+        self.assertEqual(restored["children"][0]["progress_value"], 40)
+        self.assertIsNone(find_todo(restored_schedule, "parent-1"))
+        self.assertEqual(restored_schedule["settings"]["row_height"], 34)
+
+    def test_manual_todo_returns_as_one_day_schedule(self) -> None:
+        todo = new_todo_entry(
+            KIND_PARENT,
+            "Manual",
+            "2026-08-01",
+            entry_id="todo-1",
+        )
+        schedule = {"version": 3, "parents": [], "todos": [todo]}
+        restored = move_todo_group_to_schedule(schedule, "todo-1")
+        self.assertEqual(restored["start"], date(2026, 8, 1))
+        self.assertEqual(restored["end"], date(2026, 8, 1))
+        self.assertEqual(restored["progress_value"], 0)
+        self.assertIsNone(restored["started"])
+
+    def test_rejects_unknown_future_schedule_version(self) -> None:
+        with self.assertRaises(ValueError):
+            deserialize_schedule({"version": 99, "parents": []})
+
+    def test_todo_notification_due_respects_deadline_switch_and_hour_interval(self) -> None:
+        now = datetime(2026, 7, 20, 10, 0, tzinfo=timezone(timedelta(hours=9)))
+        todo = new_todo_entry(KIND_PARENT, "Due", "2026-07-20")
+        self.assertTrue(todo_notification_due(todo, now))
+        todo["last_notified_at"] = "2026-07-20T09:01:00+09:00"
+        self.assertFalse(todo_notification_due(todo, now))
+        todo["last_notified_at"] = "2026-07-20T09:00:00+09:00"
+        self.assertTrue(todo_notification_due(todo, now))
+        todo["notify"] = False
+        self.assertFalse(todo_notification_due(todo, now))
+        todo["notify"] = True
+        todo["deadline"] = date(2026, 7, 21)
+        self.assertFalse(todo_notification_due(todo, now))
 
     def test_delay_boundaries_use_the_supplied_calendar_date(self) -> None:
         entry = self.make_parent("parent-1")

@@ -16,7 +16,7 @@ import zipfile
 
 
 SHEET_NAME = "ガントチャート"
-FIXED_COLUMN_COUNT = 6
+FIXED_COLUMN_COUNT = 7
 MAX_EXCEL_COLUMNS = 16_384
 MAX_EXCEL_ROWS = 1_048_576
 TASK_COLUMN_WIDTH = 40
@@ -57,6 +57,7 @@ HEADERS = (
     "タスク",
     "開始日",
     "終了日",
+    "着手日",
     "進捗",
     "進捗率",
     "遅延日数",
@@ -88,6 +89,7 @@ class _ExportRow:
     tree_title: str
     start: date
     end: date
+    started: date | None
     effective_visible: bool
     progress: _Progress
     delay_days: int
@@ -104,7 +106,7 @@ def export_to_excel(
     reference_date: date | datetime | str,
     output_path: str | os.PathLike[str],
 ) -> Path:
-    """v2形式の親配列をXLSXへ書き出し、出力先を返す。"""
+    """親配列をXLSXへ書き出し、出力先を返す。"""
     today = _coerce_date(reference_date, "reference_date")
     rows = _normalize_rows(parents, today)
     dates = _date_columns(rows)
@@ -182,6 +184,7 @@ def _normalize_rows(
                 ),
                 start=parent_start,
                 end=parent_end,
+                started=_optional_date(parent.get("started"), f"parents[{parent_index}].started"),
                 effective_visible=parent_visible,
                 progress=parent_progress,
                 delay_days=max(0, (today - parent_end).days),
@@ -202,6 +205,7 @@ def _normalize_rows(
                     tree_title=f"{branch} {child_title}",
                     start=child_start,
                     end=child_end,
+                    started=_optional_date(child.get("started"), f"{path}.started"),
                     effective_visible=effective_visible,
                     progress=child_progresses[child_index],
                     delay_days=max(0, (today - child_end).days),
@@ -227,6 +231,12 @@ def _schedule_dates(entry: Mapping[str, Any], path: str) -> tuple[date, date]:
     if end < start:
         raise ValueError(f"{path}のendはstart以降にしてください。")
     return start, end
+
+
+def _optional_date(value: Any, path: str) -> date | None:
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    return _coerce_date(value, path)
 
 
 def _progress(entry: Mapping[str, Any], path: str) -> _Progress:
@@ -380,7 +390,7 @@ def _build_sheet_xml(rows: Sequence[_ExportRow], dates: Sequence[date], today: d
     )
 
     columns = ET.SubElement(root, "cols")
-    widths = (TASK_COLUMN_WIDTH, 12, 12, _progress_column_width(rows), 10, 10)
+    widths = (TASK_COLUMN_WIDTH, 12, 12, 10, _progress_column_width(rows), 10, 10)
     for index, width in enumerate(widths, start=1):
         ET.SubElement(
             columns,
@@ -435,9 +445,11 @@ def _build_sheet_xml(rows: Sequence[_ExportRow], dates: Sequence[date], today: d
         _add_inline_cell(row_element, 1, row_index, export_row.tree_title, tree_style)
         _add_number_cell(row_element, 2, row_index, _excel_serial(export_row.start), date_style)
         _add_number_cell(row_element, 3, row_index, _excel_serial(export_row.end), date_style)
-        _add_inline_cell(row_element, 4, row_index, export_row.progress.label, center_style)
-        _add_number_cell(row_element, 5, row_index, export_row.progress.rate, percent_style)
-        _add_number_cell(row_element, 6, row_index, export_row.delay_days, delay_style)
+        if export_row.started is not None:
+            _add_number_cell(row_element, 4, row_index, _excel_serial(export_row.started), date_style)
+        _add_inline_cell(row_element, 5, row_index, export_row.progress.label, center_style)
+        _add_number_cell(row_element, 6, row_index, export_row.progress.rate, percent_style)
+        _add_number_cell(row_element, 7, row_index, export_row.delay_days, delay_style)
 
         if first_date is None or not export_row.effective_visible:
             continue
