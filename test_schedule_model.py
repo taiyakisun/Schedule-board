@@ -14,7 +14,9 @@ from schedule_model import (
     iter_all_todos,
     iter_all_entries,
     move_entry,
+    reorder_entry,
     move_schedule_group_to_todos,
+    reorder_todo,
     move_todo_group_to_schedule,
     new_entry,
     new_todo_entry,
@@ -225,6 +227,90 @@ class ScheduleModelTests(unittest.TestCase):
         self.assertEqual([parent["id"] for parent in schedule["parents"]], ["parent-b", "parent-a"])
         self.assertEqual([child["id"] for child in schedule["parents"][0]["children"]], ["child-b1"])
         self.assertFalse(move_entry(schedule, "parent-b", "up"))
+
+    def test_drag_reorder_moves_schedule_entries_only_within_their_siblings(self) -> None:
+        parent_a = self.make_parent("parent-a", "A")
+        parent_a["children"] = [
+            self.make_child("child-a1", parent_a["id"], "A1"),
+            self.make_child("child-a2", parent_a["id"], "A2"),
+            self.make_child("child-a3", parent_a["id"], "A3"),
+        ]
+        parent_b = self.make_parent("parent-b", "B")
+        parent_b["children"] = [self.make_child("child-b1", parent_b["id"], "B1")]
+        parent_c = self.make_parent("parent-c", "C")
+        parent_c["children"] = [self.make_child("child-c1", parent_c["id"], "C1")]
+        schedule = {"version": 3, "parents": [parent_a, parent_b, parent_c]}
+
+        self.assertTrue(reorder_entry(schedule, "parent-c", "parent-a"))
+        self.assertEqual(
+            [parent["id"] for parent in schedule["parents"]],
+            ["parent-c", "parent-a", "parent-b"],
+        )
+        self.assertEqual(schedule["parents"][0]["children"][0]["id"], "child-c1")
+        self.assertFalse(reorder_entry(schedule, "parent-c", "parent-a"))
+        self.assertTrue(reorder_entry(schedule, "parent-a", None))
+        self.assertEqual(
+            [parent["id"] for parent in schedule["parents"]],
+            ["parent-c", "parent-b", "parent-a"],
+        )
+
+        self.assertTrue(reorder_entry(schedule, "child-a3", "child-a1"))
+        self.assertEqual(
+            [child["id"] for child in parent_a["children"]],
+            ["child-a3", "child-a1", "child-a2"],
+        )
+        self.assertFalse(reorder_entry(schedule, "child-a3", "child-b1"))
+        self.assertFalse(reorder_entry(schedule, "missing", None))
+        self.assertEqual(parent_b["children"][0]["id"], "child-b1")
+
+        restored = deserialize_schedule(serialize_schedule(schedule))
+        self.assertEqual(
+            [parent["id"] for parent in restored["parents"]],
+            ["parent-c", "parent-b", "parent-a"],
+        )
+        self.assertEqual(
+            [child["id"] for child in restored["parents"][2]["children"]],
+            ["child-a3", "child-a1", "child-a2"],
+        )
+
+    def test_drag_reorder_moves_todos_only_within_their_siblings(self) -> None:
+        todo_a = new_todo_entry(KIND_PARENT, "A", "2026-07-20", entry_id="todo-a")
+        todo_a["children"] = [
+            new_todo_entry(
+                KIND_CHILD,
+                f"A{index}",
+                "2026-07-20",
+                parent_id=todo_a["id"],
+                entry_id=f"todo-a{index}",
+            )
+            for index in range(1, 4)
+        ]
+        todo_b = new_todo_entry(KIND_PARENT, "B", "2026-07-20", entry_id="todo-b")
+        todo_b["children"] = [
+            new_todo_entry(
+                KIND_CHILD,
+                "B1",
+                "2026-07-20",
+                parent_id=todo_b["id"],
+                entry_id="todo-b1",
+            )
+        ]
+        todo_c = new_todo_entry(KIND_PARENT, "C", "2026-07-20", entry_id="todo-c")
+        schedule = {"version": 3, "parents": [], "todos": [todo_a, todo_b, todo_c]}
+
+        self.assertTrue(reorder_todo(schedule, "todo-c", "todo-a"))
+        self.assertEqual(
+            [todo["id"] for todo in schedule["todos"]],
+            ["todo-c", "todo-a", "todo-b"],
+        )
+        self.assertTrue(reorder_todo(schedule, "todo-a1", None))
+        self.assertEqual(
+            [todo["id"] for todo in todo_a["children"]],
+            ["todo-a2", "todo-a3", "todo-a1"],
+        )
+        self.assertFalse(reorder_todo(schedule, "todo-a1", "todo-b1"))
+        self.assertFalse(reorder_todo(schedule, "todo-a1", None))
+        self.assertEqual(todo_b["children"][0]["id"], "todo-b1")
 
     def test_remove_child_and_parent_cascade(self) -> None:
         parent_a = self.make_parent("parent-a")

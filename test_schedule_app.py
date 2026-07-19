@@ -91,6 +91,25 @@ class ApplicationResourceTests(unittest.TestCase):
         )
         self.assertIs(root._sch_gantt_icon_image, icon_image)
 
+    def test_close_request_requires_confirmation(self) -> None:
+        app = app_module.ScheduleApp.__new__(app_module.ScheduleApp)
+        app.root = Mock()
+
+        with patch.object(app_module.messagebox, "askyesno", return_value=False) as ask:
+            app._on_close_requested()
+
+        ask.assert_called_once_with(
+            app_module.CONFIRM_EXIT_TITLE,
+            app_module.CONFIRM_EXIT_MESSAGE,
+            parent=app.root,
+        )
+        app.root.destroy.assert_not_called()
+
+        with patch.object(app_module.messagebox, "askyesno", return_value=True):
+            app._on_close_requested()
+
+        app.root.destroy.assert_called_once_with()
+
 
 class ScheduleAppLogicTests(unittest.TestCase):
     def make_app(self, parents: list[dict] | None = None) -> app_module.ScheduleApp:
@@ -684,10 +703,7 @@ class ScheduleAppLogicTests(unittest.TestCase):
         app._switch_mode = Mock()
         app._save = Mock(return_value=False)
 
-        with (
-            patch.object(app_module.messagebox, "askyesno", return_value=True),
-            patch.object(app_module.messagebox, "showerror"),
-        ):
+        with patch.object(app_module.messagebox, "showerror"):
             app._on_move_to_todo()
 
         self.assertEqual([item["id"] for item in app.entries], [parent["id"]])
@@ -695,6 +711,22 @@ class ScheduleAppLogicTests(unittest.TestCase):
         self.assertEqual(app.todos, [])
         self.assertEqual(app.selected_id, child_a["id"])
         app._switch_mode.assert_not_called()
+
+    def test_drag_reorder_rolls_back_order_when_save_fails(self) -> None:
+        parent, child_a, child_b = self.make_hierarchy()
+        app = self.make_app([parent])
+        app.selected_id = child_b["id"]
+        app._save = Mock(return_value=False)
+
+        moved = app._commit_row_reorder("schedule", child_b["id"], child_a["id"])
+
+        self.assertFalse(moved)
+        self.assertEqual(
+            [child["id"] for child in app.entries[0]["children"]],
+            [child_a["id"], child_b["id"]],
+        )
+        self.assertEqual(app.selected_id, child_b["id"])
+        app._rebuild_rows.assert_called_once_with()
 
     def test_move_to_todo_succeeds_with_default_notifications_off(self) -> None:
         parent, child_a, _child_b = self.make_hierarchy()
@@ -707,15 +739,42 @@ class ScheduleAppLogicTests(unittest.TestCase):
         app._rebuild_todo_rows = Mock()
         app._switch_mode = Mock()
         app._save = Mock(return_value=True)
+        app.active_mode = "schedule"
 
-        with patch.object(app_module.messagebox, "askyesno", return_value=True):
+        with patch.object(app_module.messagebox, "askyesno") as ask:
             app._on_move_to_todo()
 
+        ask.assert_not_called()
         self.assertEqual(app.entries, [])
         self.assertEqual(app.todos[0]["id"], parent["id"])
         self.assertFalse(app.todos[0]["notify"])
         self.assertFalse(any(child["notify"] for child in app.todos[0]["children"]))
-        app._switch_mode.assert_called_once_with("todo")
+        self.assertEqual(app.active_mode, "schedule")
+        app._switch_mode.assert_not_called()
+
+    def test_move_to_schedule_succeeds_without_confirmation_or_view_switch(self) -> None:
+        parent, child_a, _child_b = self.make_hierarchy()
+        app = self.make_app([parent])
+        app.schedule["todos"] = []
+        app.schedule["settings"] = {"row_height": 40}
+        app.todos = app.schedule["todos"]
+        app.selected_id = child_a["id"]
+        app.selected_todo_id = None
+        app._rebuild_todo_rows = Mock()
+        app._switch_mode = Mock()
+        app._save = Mock(return_value=True)
+        app._on_move_to_todo()
+        app.active_mode = "todo"
+
+        with patch.object(app_module.messagebox, "askyesno") as ask:
+            app._on_move_to_schedule()
+
+        ask.assert_not_called()
+        self.assertEqual(app.todos, [])
+        self.assertEqual(app.entries[0]["id"], parent["id"])
+        self.assertEqual(app.selected_id, parent["id"])
+        self.assertEqual(app.active_mode, "todo")
+        app._switch_mode.assert_not_called()
 
 
 if __name__ == "__main__":

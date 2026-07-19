@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import tkinter as tk
 from tkinter import ttk
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
@@ -71,6 +72,7 @@ class ScheduleAppTkTests(unittest.TestCase):
 
     def test_theme_fonts_tree_and_row_dimensions(self) -> None:
         self.assertEqual(self.root.title(), "Schedule-board")
+        self.assertTrue(self.root.protocol("WM_DELETE_WINDOW"))
         self.assertEqual(self.root.cget("bg").upper(), app_module.COLOR_APP_BG)
         self.assertEqual(self.app.style.theme_use(), "clam")
         self.assertEqual(
@@ -79,7 +81,8 @@ class ScheduleAppTkTests(unittest.TestCase):
                 app_module.TEXT_ADD_MENU,
                 app_module.TEXT_MOVE_TO_TODO,
                 app_module.TEXT_DELETE,
-                app_module.TEXT_ORDER,
+                app_module.TEXT_UP,
+                app_module.TEXT_DOWN,
                 app_module.TEXT_MORE,
             },
         )
@@ -88,20 +91,27 @@ class ScheduleAppTkTests(unittest.TestCase):
                 isinstance(control, ttk.Menubutton)
                 for control in self.app.toolbar_buttons.values()
             ),
-            3,
+            2,
         )
         add_menu = self.app.toolbar_buttons[app_module.TEXT_ADD_MENU].menu
         self.assertEqual(add_menu.entrycget(0, "label"), "親タスクを追加")
         self.assertEqual(add_menu.entrycget(1, "label"), "子タスクを追加")
         self.assertEqual(
-            len(
-                [
-                    control
-                    for control in self.app.todo_toolbar.winfo_children()
-                    if isinstance(control, (ttk.Button, ttk.Menubutton))
-                ]
-            ),
-            5,
+            set(self.app.todo_toolbar_buttons),
+            {
+                app_module.TEXT_ADD_MENU,
+                app_module.TEXT_MOVE_TO_SCHEDULE,
+                app_module.TEXT_DELETE,
+                app_module.TEXT_UP,
+                app_module.TEXT_DOWN,
+                app_module.TEXT_SETTINGS,
+            },
+        )
+        self.assertTrue(
+            isinstance(self.app.toolbar_buttons[app_module.TEXT_UP], ttk.Button)
+        )
+        self.assertTrue(
+            isinstance(self.app.toolbar_buttons[app_module.TEXT_DOWN], ttk.Button)
         )
 
         task_font = self.app.task_font.actual()
@@ -122,6 +132,9 @@ class ScheduleAppTkTests(unittest.TestCase):
         self.assertEqual(rows[1].task_label.cget("font"), str(self.app.task_font))
         self.assertEqual(rows[0].started_label.cget("text"), "07/14")
         for row in rows:
+            self.assertEqual(row.drag_handle.cget("text"), app_module.DRAG_HANDLE_TEXT)
+            self.assertEqual(row.drag_handle.cget("cursor"), "fleur")
+            self.assertTrue(row.drag_handle.bind("<B1-Motion>"))
             self.assertEqual(row.task_frame.winfo_height(), self.app.row_content_height)
             self.assertEqual(row.gantt_canvas.winfo_height(), self.app.row_content_height)
             self.assertGreaterEqual(row.task_label.winfo_height(), self.app.task_font.metrics("linespace"))
@@ -151,6 +164,348 @@ class ScheduleAppTkTests(unittest.TestCase):
         )
         self.assertFalse(self.app.schedule_toolbar.winfo_ismapped())
         self.assertTrue(self.app.todo_toolbar.winfo_ismapped())
+
+    def test_moves_between_lists_keep_the_current_view(self) -> None:
+        self.app.selected_id = self.child_a["id"]
+
+        self.app._on_move_to_todo()
+        self._pump()
+
+        self.assertEqual(self.app.active_mode, "schedule")
+        self.assertTrue(self.app.schedule_toolbar.winfo_ismapped())
+        self.assertFalse(self.app.todo_toolbar.winfo_ismapped())
+
+        self.app._switch_mode("todo")
+        self._pump()
+        self.app._on_move_to_schedule()
+        self._pump()
+
+        self.assertEqual(self.app.active_mode, "todo")
+        self.assertFalse(self.app.schedule_toolbar.winfo_ismapped())
+        self.assertTrue(self.app.todo_toolbar.winfo_ismapped())
+
+    def test_separate_up_down_buttons_support_repeated_moves(self) -> None:
+        child_c = new_entry(
+            KIND_CHILD,
+            "連続移動するタスク",
+            "2026-07-25",
+            "2026-07-28",
+            parent_id=self.parent["id"],
+            entry_id="child-c",
+        )
+        self.parent["children"].append(child_c)
+        self.app.selected_id = child_c["id"]
+        self.app._rebuild_rows()
+
+        self.app.toolbar_buttons[app_module.TEXT_UP].invoke()
+        self.app.toolbar_buttons[app_module.TEXT_UP].invoke()
+        self._pump()
+
+        self.assertEqual(
+            [child["id"] for child in self.parent["children"]],
+            ["child-c", "child-a", "child-b"],
+        )
+
+    def test_schedule_parent_drag_shows_group_preview_and_reorders_group(self) -> None:
+        second_parent = new_entry(
+            KIND_PARENT,
+            "第2の親タスク",
+            "2026-08-01",
+            "2026-08-31",
+            entry_id="parent-2",
+        )
+        second_parent["children"] = [
+            new_entry(
+                KIND_CHILD,
+                "第2の子タスク",
+                "2026-08-01",
+                "2026-08-10",
+                parent_id=second_parent["id"],
+                entry_id="child-2",
+            )
+        ]
+        self.app.entries.append(second_parent)
+        self.app._rebuild_rows()
+        self._pump()
+        source = self.app.row_widgets[0]
+        target = self.app.row_widgets[-1]
+        start_event = SimpleNamespace(
+            x_root=source.drag_handle.winfo_rootx(),
+            y_root=source.drag_handle.winfo_rooty() + 2,
+        )
+        drop_event = SimpleNamespace(
+            x_root=start_event.x_root,
+            y_root=target.container.winfo_rooty() + target.container.winfo_height() - 2,
+        )
+
+        self.app._on_row_drag_press("schedule", self.parent["id"], start_event)
+        self.app._on_row_drag_motion("schedule", self.parent["id"], drop_event)
+        self._pump()
+
+        state = self.app._row_drag
+        self.assertIsNotNone(state)
+        self.assertTrue(state.active)
+        self.assertTrue(state.target_valid)
+        self.assertIsNotNone(state.placeholder)
+        self.assertGreaterEqual(
+            state.placeholder.winfo_height(),
+            self.app.row_content_height * 3,
+        )
+        self.assertFalse(source.container.winfo_ismapped())
+
+        self.app._on_row_drag_release("schedule", self.parent["id"], drop_event)
+        self._pump()
+
+        self.assertEqual(
+            [parent["id"] for parent in self.app.entries],
+            ["parent-2", "parent-1"],
+        )
+        self.assertEqual(
+            [child["id"] for child in self.app.entries[1]["children"]],
+            ["child-a", "child-b"],
+        )
+
+    def test_drag_preview_to_top_keeps_short_list_at_canvas_top(self) -> None:
+        parent_a = new_entry(
+            KIND_PARENT,
+            "先頭の親",
+            "2026-07-01",
+            "2026-07-10",
+            entry_id="top-parent-a",
+        )
+        parent_b = new_entry(
+            KIND_PARENT,
+            "中央の親",
+            "2026-07-01",
+            "2026-07-10",
+            entry_id="top-parent-b",
+        )
+        parent_c = new_entry(
+            KIND_PARENT,
+            "末尾から移動する親",
+            "2026-07-01",
+            "2026-07-10",
+            entry_id="top-parent-c",
+        )
+        parent_c["children"] = [
+            new_entry(
+                KIND_CHILD,
+                "末尾親の子",
+                "2026-07-01",
+                "2026-07-02",
+                parent_id=parent_c["id"],
+                entry_id="top-child-c",
+            )
+        ]
+        self.app.schedule = {
+            "version": 3,
+            "parents": [parent_a, parent_b, parent_c],
+            "todos": [],
+            "settings": {"row_height": 40},
+        }
+        self.app._ensure_schedule_defaults()
+        self.app._rebuild_rows()
+        self._pump()
+        source = next(
+            row for row in self.app.row_widgets if row.entry_id == parent_c["id"]
+        )
+        start_event = SimpleNamespace(
+            x_root=source.drag_handle.winfo_rootx(),
+            y_root=source.drag_handle.winfo_rooty() + 2,
+        )
+        top_event = SimpleNamespace(
+            x_root=start_event.x_root,
+            y_root=self.app.rows_canvas.winfo_rooty() + 2,
+        )
+
+        self.app._on_row_drag_press("schedule", source.entry_id, start_event)
+        for _index in range(10):
+            self.app._on_row_drag_motion("schedule", source.entry_id, top_event)
+            self._pump()
+
+        state = self.app._row_drag
+        self.assertTrue(state.target_valid)
+        self.assertIsNotNone(state.placeholder)
+        self.assertAlmostEqual(self.app.rows_canvas.yview()[0], 0.0, places=3)
+        self.assertLessEqual(
+            abs(
+                state.placeholder.winfo_rooty()
+                - self.app.rows_canvas.winfo_rooty()
+            ),
+            2,
+        )
+        self.app._on_row_drag_escape()
+
+    def test_drag_auto_scroll_remains_available_for_long_lists(self) -> None:
+        parents = [
+            new_entry(
+                KIND_PARENT,
+                f"スクロール対象 {index}",
+                "2026-07-01",
+                "2026-07-31",
+                entry_id=f"scroll-parent-{index}",
+            )
+            for index in range(45)
+        ]
+        self.app.schedule = {"version": 3, "parents": parents, "todos": []}
+        self.app._ensure_schedule_defaults()
+        self.app._rebuild_rows()
+        self._pump()
+        canvas = self.app.rows_canvas
+        canvas.yview_moveto(0.5)
+        self._pump()
+        middle = canvas.yview()[0]
+
+        self.app._auto_scroll_row_drag("schedule", canvas.winfo_rooty() + 1)
+        self._pump()
+        moved_up = canvas.yview()[0]
+        self.assertLess(moved_up, middle)
+
+        self.app._auto_scroll_row_drag(
+            "schedule",
+            canvas.winfo_rooty() + canvas.winfo_height() - 1,
+        )
+        self._pump()
+        self.assertGreater(canvas.yview()[0], moved_up)
+
+    def test_drag_threshold_escape_and_parent_boundary_preserve_order(self) -> None:
+        source = self.app.row_widgets[1]
+        target = self.app.row_widgets[2]
+        start_event = SimpleNamespace(
+            x_root=source.drag_handle.winfo_rootx(),
+            y_root=source.drag_handle.winfo_rooty() + 2,
+        )
+        small_motion = SimpleNamespace(
+            x_root=start_event.x_root,
+            y_root=start_event.y_root + app_module.DRAG_START_THRESHOLD - 1,
+        )
+        drop_event = SimpleNamespace(
+            x_root=start_event.x_root,
+            y_root=target.container.winfo_rooty() + target.container.winfo_height() - 2,
+        )
+        original_order = [child["id"] for child in self.parent["children"]]
+        self.app._save.reset_mock()
+
+        self.app._on_row_drag_press("schedule", source.entry_id, start_event)
+        self.app._on_row_drag_motion("schedule", source.entry_id, small_motion)
+        self.app._on_row_drag_release("schedule", source.entry_id, small_motion)
+        self.assertEqual(
+            [child["id"] for child in self.parent["children"]],
+            original_order,
+        )
+        self.app._save.assert_not_called()
+
+        self.app._on_row_drag_press("schedule", source.entry_id, start_event)
+        self.app._on_row_drag_motion("schedule", source.entry_id, drop_event)
+        self._pump()
+        self.assertIsNotNone(self.app._row_drag.placeholder)
+        self.assertEqual(self.app._on_row_drag_escape(), "break")
+        self._pump()
+        self.assertIsNone(self.app._row_drag)
+        self.assertEqual(
+            [child["id"] for child in self.parent["children"]],
+            original_order,
+        )
+        self.assertTrue(all(row.container.winfo_ismapped() for row in self.app.row_widgets))
+        self.app._save.assert_not_called()
+
+        second_parent = new_entry(
+            KIND_PARENT,
+            "別の親",
+            "2026-08-01",
+            "2026-08-10",
+            entry_id="boundary-parent",
+        )
+        second_parent["children"] = [
+            new_entry(
+                KIND_CHILD,
+                "別の親の子",
+                "2026-08-01",
+                "2026-08-02",
+                parent_id=second_parent["id"],
+                entry_id="boundary-child",
+            )
+        ]
+        self.app.entries.append(second_parent)
+        self.app._rebuild_rows()
+        self._pump()
+        source = next(row for row in self.app.row_widgets if row.entry_id == "child-a")
+        foreign = next(
+            row for row in self.app.row_widgets if row.entry_id == "boundary-child"
+        )
+        start_event = SimpleNamespace(
+            x_root=source.drag_handle.winfo_rootx(),
+            y_root=source.drag_handle.winfo_rooty() + 2,
+        )
+        foreign_event = SimpleNamespace(
+            x_root=start_event.x_root,
+            y_root=foreign.container.winfo_rooty() + 2,
+        )
+        self.app._on_row_drag_press("schedule", source.entry_id, start_event)
+        self.app._on_row_drag_motion("schedule", source.entry_id, foreign_event)
+        self.assertFalse(self.app._row_drag.target_valid)
+        self.assertIsNone(self.app._row_drag.placeholder)
+        self.app._on_row_drag_release("schedule", source.entry_id, foreign_event)
+        self.assertEqual(
+            [child["id"] for child in self.parent["children"]],
+            original_order,
+        )
+
+    def test_todo_child_drag_reorders_only_inside_its_parent(self) -> None:
+        parent = new_todo_entry(
+            KIND_PARENT,
+            "親TODO",
+            "2026-07-20",
+            entry_id="todo-parent-drag",
+        )
+        parent["children"] = [
+            new_todo_entry(
+                KIND_CHILD,
+                f"子TODO {index}",
+                "2026-07-20",
+                parent_id=parent["id"],
+                entry_id=f"todo-child-{index}",
+            )
+            for index in (1, 2)
+        ]
+        self.app.schedule["todos"] = [parent]
+        self.app._ensure_schedule_defaults()
+        self.app._rebuild_todo_rows()
+        self.app._switch_mode("todo")
+        self._pump()
+        source = self.app.todo_row_widgets[1]
+        target = self.app.todo_row_widgets[2]
+        start_event = SimpleNamespace(
+            x_root=source.drag_handle.winfo_rootx(),
+            y_root=source.drag_handle.winfo_rooty() + 2,
+        )
+        drop_event = SimpleNamespace(
+            x_root=start_event.x_root,
+            y_root=target.container.winfo_rooty() + target.container.winfo_height() - 2,
+        )
+
+        self.app._on_row_drag_press("todo", source.entry_id, start_event)
+        self.app._on_row_drag_motion("todo", source.entry_id, drop_event)
+        self._pump()
+        self.assertIsNotNone(self.app._row_drag.placeholder)
+        self.app._on_row_drag_release("todo", source.entry_id, drop_event)
+        self._pump()
+
+        self.assertEqual(
+            [child["id"] for child in parent["children"]],
+            ["todo-child-2", "todo-child-1"],
+        )
+        self.app.selected_todo_id = "todo-child-1"
+        self.app.todo_toolbar_buttons[app_module.TEXT_UP].invoke()
+        self.assertEqual(
+            [child["id"] for child in parent["children"]],
+            ["todo-child-1", "todo-child-2"],
+        )
+        self.app.todo_toolbar_buttons[app_module.TEXT_DOWN].invoke()
+        self.assertEqual(
+            [child["id"] for child in parent["children"]],
+            ["todo-child-2", "todo-child-1"],
+        )
 
     def test_scale_year_month_and_day_labels_do_not_overlap(self) -> None:
         self.app._redraw_scale()

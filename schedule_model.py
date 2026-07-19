@@ -573,6 +573,56 @@ def move_entry(schedule: dict, entry_id: str, direction: int | str) -> bool:
     return True
 
 
+def _reorder_siblings(
+    siblings: list[dict],
+    entry_id: str,
+    before_id: str | None,
+) -> bool:
+    source_id = str(entry_id)
+    source_index = next(
+        (index for index, item in enumerate(siblings) if str(item.get("id")) == source_id),
+        None,
+    )
+    if source_index is None or (before_id is not None and str(before_id) == source_id):
+        return False
+
+    reordered = list(siblings)
+    moved = reordered.pop(source_index)
+    if before_id is None:
+        target_index = len(reordered)
+    else:
+        target_id = str(before_id)
+        target_index = next(
+            (
+                index
+                for index, item in enumerate(reordered)
+                if str(item.get("id")) == target_id
+            ),
+            -1,
+        )
+        if target_index < 0:
+            return False
+    reordered.insert(target_index, moved)
+    if [item.get("id") for item in reordered] == [item.get("id") for item in siblings]:
+        return False
+    siblings[:] = reordered
+    return True
+
+
+def reorder_entry(schedule: dict, entry_id: str, before_id: str | None) -> bool:
+    """同じ階層内で、対象をbefore_idの直前または末尾へ移動する。"""
+
+    location = find_entry(schedule, entry_id)
+    if location is None:
+        return False
+    siblings = (
+        schedule.get("parents", [])
+        if location.is_parent
+        else location.parent.get("children", [])
+    )
+    return _reorder_siblings(siblings, entry_id, before_id)
+
+
 def remove_entry(schedule: dict, entry_id: str) -> list[dict]:
     """Remove an entry in place and return all removed entries in display order."""
 
@@ -652,6 +702,20 @@ def move_todo(schedule: dict, entry_id: str, direction: int | str) -> bool:
         return False
     siblings[source_index], siblings[target_index] = siblings[target_index], siblings[source_index]
     return True
+
+
+def reorder_todo(schedule: dict, entry_id: str, before_id: str | None) -> bool:
+    """同じ階層内で、TODOをbefore_idの直前または末尾へ移動する。"""
+
+    location = find_todo(schedule, entry_id)
+    if location is None:
+        return False
+    siblings = (
+        schedule.get("todos", [])
+        if location.is_parent
+        else location.parent.get("children", [])
+    )
+    return _reorder_siblings(siblings, entry_id, before_id)
 
 
 def remove_todo(schedule: dict, entry_id: str) -> list[dict]:

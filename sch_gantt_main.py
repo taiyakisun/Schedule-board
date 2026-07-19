@@ -19,8 +19,10 @@ from schedule_model import (
     iter_all_todos,
     iter_all_entries,
     move_entry,
+    reorder_entry,
     move_schedule_group_to_todos,
     move_todo,
+    reorder_todo,
     move_todo_group_to_schedule,
     new_entry,
     new_todo_entry,
@@ -49,6 +51,8 @@ DATA_FILE = os.path.join(application_directory(), "schedules.json")
 COMPLETE_LOG_FILE = os.path.join(application_directory(), "completed_tasks.jsonl")
 
 TITLE_APP = "Schedule-board"
+CONFIRM_EXIT_TITLE = "終了確認"
+CONFIRM_EXIT_MESSAGE = "Schedule-boardを終了しますか？"
 LABEL_VISIBILITY = "表示"
 LABEL_TASK = "タスク"
 LABEL_PROGRESS = "進捗度"
@@ -69,7 +73,6 @@ TEXT_MOVE_TO_TODO = "TODOへ移動"
 TEXT_MOVE_TO_SCHEDULE = "タスクへ移動"
 TEXT_SETTINGS = "表示設定"
 TEXT_ADD_MENU = "追加"
-TEXT_ORDER = "並べ替え"
 TEXT_MORE = "その他"
 VISIBLE_TEXT = "表示"
 HIDDEN_TEXT = "非表示"
@@ -83,6 +86,8 @@ TEXT_VALUE_MODE = "指定数値"
 COMPLETE_BUTTON_WIDTH = 8
 ROW_CONTENT_MIN_HEIGHT = 30
 ROW_CONTENT_DEFAULT_HEIGHT = 40
+DRAG_HANDLE_TEXT = "↕"
+DRAG_START_THRESHOLD = 5
 
 
 def scale_header_row_positions(
@@ -417,6 +422,7 @@ class RowWidgets:
     entry_id: str
     container: tk.Frame
     selection_bar: tk.Frame
+    drag_handle: tk.Label
     visibility_label: tk.Label
     task_frame: tk.Frame
     tree_indicator: tk.Label
@@ -436,11 +442,24 @@ class TodoRowWidgets:
     entry_id: str
     container: tk.Frame
     selection_bar: tk.Frame
+    drag_handle: tk.Label
     tree_indicator: tk.Label
     task_label: tk.Label
     deadline_label: tk.Label
     notify_button: ttk.Button
     base_bg: str
+
+
+@dataclass
+class RowDragState:
+    mode: str
+    entry_id: str
+    start_root_x: int
+    start_root_y: int
+    active: bool = False
+    target_valid: bool = False
+    before_id: str | None = None
+    placeholder: tk.Frame | None = None
 
 
 class ScheduleApp:
@@ -467,6 +486,8 @@ class ScheduleApp:
         self.selected_id: str | None = None
         self.selected_todo_id: str | None = None
         self.active_mode = "schedule"
+        self._row_drag: RowDragState | None = None
+        self._after_ids: set[str] = set()
 
         self.task_font = tkfont.nametofont("TkDefaultFont")
         self.task_font.configure(size=10)
@@ -495,6 +516,9 @@ class ScheduleApp:
         self.today_label_screen_x: float | None = None
 
         self._build_ui()
+        self.root.bind("<Escape>", self._on_row_drag_escape, add="+")
+        self.root.bind("<Destroy>", self._on_root_destroy, add="+")
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close_requested)
         self._load()
         self._ensure_schedule_defaults()
         self.row_content_height = self._normalized_row_height(
@@ -503,10 +527,10 @@ class ScheduleApp:
         self._update_initial_task_width()
         self._rebuild_rows()
         self._rebuild_todo_rows()
-        self.root.after(100, self._redraw_scale)
-        self.root.after(100, self._redraw_all_gantt)
-        self.root.after(JST_MONITOR_MS, self._monitor_jst_date)
-        self.root.after(5_000, self._check_todo_notifications)
+        self._schedule_after(100, self._redraw_scale)
+        self._schedule_after(100, self._redraw_all_gantt)
+        self._schedule_after(JST_MONITOR_MS, self._monitor_jst_date)
+        self._schedule_after(5_000, self._check_todo_notifications)
 
     def _normalized_row_height(self, value: object) -> int:
         try:
@@ -687,6 +711,35 @@ class ScheduleApp:
             borderwidth=0,
         )
 
+    def _schedule_after(self, delay_ms: int, callback) -> str:
+        after_id = ""
+
+        def run_callback() -> None:
+            self._after_ids.discard(after_id)
+            callback()
+
+        after_id = self.root.after(delay_ms, run_callback)
+        self._after_ids.add(after_id)
+        return after_id
+
+    def _on_root_destroy(self, event: tk.Event) -> None:
+        if event.widget is not self.root:
+            return
+        for after_id in tuple(self._after_ids):
+            try:
+                self.root.after_cancel(after_id)
+            except tk.TclError:
+                pass
+        self._after_ids.clear()
+
+    def _on_close_requested(self) -> None:
+        if messagebox.askyesno(
+            CONFIRM_EXIT_TITLE,
+            CONFIRM_EXIT_MESSAGE,
+            parent=self.root,
+        ):
+            self.root.destroy()
+
     def _monitor_jst_date(self) -> None:
         latest = today_in_jst()
         if latest != self.current_jst_date:
@@ -697,7 +750,7 @@ class ScheduleApp:
             self._rebuild_todo_rows()
             self._redraw_scale()
             self._redraw_all_gantt()
-        self.root.after(JST_MONITOR_MS, self._monitor_jst_date)
+        self._schedule_after(JST_MONITOR_MS, self._monitor_jst_date)
 
     def _check_todo_notifications(self) -> None:
         now = datetime.now(JST)
@@ -719,7 +772,7 @@ class ScheduleApp:
                 for todo in due_todos:
                     todo["last_notified_at"] = now.isoformat(timespec="seconds")
                 self._save_or_restore(snapshot)
-        self.root.after(TODO_MONITOR_MS, self._check_todo_notifications)
+        self._schedule_after(TODO_MONITOR_MS, self._check_todo_notifications)
 
     # ----- persistence -----
     def _load(self) -> None:
@@ -1164,11 +1217,19 @@ class ScheduleApp:
             style="Danger.TButton",
             cursor="hand2",
         )
-        schedule_order = create_menu_button(
+        schedule_up = ttk.Button(
             self.schedule_toolbar,
-            "並べ替え",
-            (("↑ 上へ", self._on_up), ("↓ 下へ", self._on_down)),
-            "Secondary.TMenubutton",
+            text="↑ 上へ",
+            command=self._on_up,
+            style="Secondary.TButton",
+            cursor="hand2",
+        )
+        schedule_down = ttk.Button(
+            self.schedule_toolbar,
+            text="↓ 下へ",
+            command=self._on_down,
+            style="Secondary.TButton",
+            cursor="hand2",
         )
         schedule_more = create_menu_button(
             self.schedule_toolbar,
@@ -1185,7 +1246,8 @@ class ScheduleApp:
             (TEXT_ADD_MENU, schedule_add),
             (TEXT_MOVE_TO_TODO, schedule_move),
             (TEXT_DELETE, schedule_delete),
-            (TEXT_ORDER, schedule_order),
+            (TEXT_UP, schedule_up),
+            (TEXT_DOWN, schedule_down),
             (TEXT_MORE, schedule_more),
         )
         for column, (key, control) in enumerate(schedule_controls):
@@ -1218,14 +1280,19 @@ class ScheduleApp:
             style="Danger.TButton",
             cursor="hand2",
         )
-        todo_order = create_menu_button(
+        todo_up = ttk.Button(
             self.todo_toolbar,
-            "並べ替え",
-            (
-                ("↑ 上へ", lambda: self._move_selected_todo(-1)),
-                ("↓ 下へ", lambda: self._move_selected_todo(1)),
-            ),
-            "Secondary.TMenubutton",
+            text="↑ 上へ",
+            command=lambda: self._move_selected_todo(-1),
+            style="Secondary.TButton",
+            cursor="hand2",
+        )
+        todo_down = ttk.Button(
+            self.todo_toolbar,
+            text="↓ 下へ",
+            command=lambda: self._move_selected_todo(1),
+            style="Secondary.TButton",
+            cursor="hand2",
         )
         todo_settings = ttk.Button(
             self.todo_toolbar,
@@ -1234,15 +1301,23 @@ class ScheduleApp:
             style="Secondary.TButton",
             cursor="hand2",
         )
-        for column, control in enumerate(
-            (todo_add, todo_move, todo_delete, todo_order, todo_settings)
-        ):
+        self.todo_toolbar_buttons: dict[str, tk.Widget] = {}
+        todo_controls = (
+            (TEXT_ADD_MENU, todo_add),
+            (TEXT_MOVE_TO_SCHEDULE, todo_move),
+            (TEXT_DELETE, todo_delete),
+            (TEXT_UP, todo_up),
+            (TEXT_DOWN, todo_down),
+            (TEXT_SETTINGS, todo_settings),
+        )
+        for column, (key, control) in enumerate(todo_controls):
             control.grid(
                 row=0,
                 column=column,
                 sticky="w",
                 padx=(0, 14 if column == 0 else 7),
             )
+            self.todo_toolbar_buttons[key] = control
 
         self.header = tk.Frame(
             self.root,
@@ -1417,6 +1492,7 @@ class ScheduleApp:
     def _switch_mode(self, mode: str) -> None:
         if mode not in ("schedule", "todo"):
             return
+        self._cancel_row_drag()
         self.active_mode = mode
         schedule_active = mode == "schedule"
         for is_active, frame, label, indicator in (
@@ -1466,6 +1542,339 @@ class ScheduleApp:
     def _on_rows_mousewheel(self, event: tk.Event) -> str:
         if event.delta:
             self.rows_canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+        return "break"
+
+    # ----- drag and drop ordering -----
+    def _bind_row_drag_handle(
+        self,
+        handle: tk.Label,
+        mode: str,
+        entry_id: str,
+    ) -> None:
+        handle.bind(
+            "<ButtonPress-1>",
+            lambda event, item_mode=mode, item_id=entry_id: self._on_row_drag_press(
+                item_mode, item_id, event
+            ),
+        )
+        handle.bind(
+            "<B1-Motion>",
+            lambda event, item_mode=mode, item_id=entry_id: self._on_row_drag_motion(
+                item_mode, item_id, event
+            ),
+        )
+        handle.bind(
+            "<ButtonRelease-1>",
+            lambda event, item_mode=mode, item_id=entry_id: self._on_row_drag_release(
+                item_mode, item_id, event
+            ),
+        )
+        handle.bind(
+            "<MouseWheel>",
+            self._on_rows_mousewheel if mode == "schedule" else self._on_todo_mousewheel,
+        )
+
+    def _drag_widgets(self, mode: str) -> list[RowWidgets | TodoRowWidgets]:
+        return self.row_widgets if mode == "schedule" else self.todo_row_widgets
+
+    def _drag_container(self, mode: str) -> tk.Frame:
+        return self.rows_container if mode == "schedule" else self.todo_rows_container
+
+    def _drag_canvas(self, mode: str) -> tk.Canvas:
+        return self.rows_canvas if mode == "schedule" else self.todo_rows_canvas
+
+    def _drag_location(self, mode: str, entry_id: str):
+        finder = find_entry if mode == "schedule" else find_todo
+        return finder(self.schedule, entry_id)
+
+    def _drag_block_widgets(
+        self,
+        mode: str,
+        entry_id: str,
+    ) -> list[RowWidgets | TodoRowWidgets]:
+        location = self._drag_location(mode, entry_id)
+        if location is None:
+            return []
+        block_ids = [entry_id]
+        if location.is_parent and not location.entry.get("collapsed", False):
+            block_ids.extend(child["id"] for child in location.entry.get("children", []))
+        widget_by_id = {widgets.entry_id: widgets for widgets in self._drag_widgets(mode)}
+        return [widget_by_id[item_id] for item_id in block_ids if item_id in widget_by_id]
+
+    def _drag_sibling_ids(self, mode: str, entry_id: str) -> list[str]:
+        location = self._drag_location(mode, entry_id)
+        if location is None:
+            return []
+        root_key = "parents" if mode == "schedule" else "todos"
+        siblings = (
+            self.schedule.get(root_key, [])
+            if location.is_parent
+            else location.parent.get("children", [])
+        )
+        return [str(item["id"]) for item in siblings]
+
+    def _drag_allowed_vertical_range(
+        self,
+        mode: str,
+        entry_id: str,
+    ) -> tuple[int, int] | None:
+        location = self._drag_location(mode, entry_id)
+        if location is None:
+            return None
+        container = self._drag_container(mode)
+        if location.is_parent:
+            return (
+                container.winfo_rooty(),
+                container.winfo_rooty() + container.winfo_height(),
+            )
+
+        parent_block = self._drag_block_widgets(mode, location.parent["id"])
+        if not parent_block:
+            return None
+        top = parent_block[0].container.winfo_rooty() + parent_block[0].container.winfo_height()
+        root_key = "parents" if mode == "schedule" else "todos"
+        parents = self.schedule.get(root_key, [])
+        next_parent = (
+            parents[location.parent_index + 1]
+            if location.parent_index + 1 < len(parents)
+            else None
+        )
+        if next_parent is not None:
+            next_block = self._drag_block_widgets(mode, next_parent["id"])
+            bottom = next_block[0].container.winfo_rooty() if next_block else top
+        else:
+            bottom = container.winfo_rooty() + container.winfo_height()
+        return top, bottom
+
+    def _drag_destination(
+        self,
+        mode: str,
+        entry_id: str,
+        pointer_root_y: int,
+    ) -> tuple[bool, str | None]:
+        remaining_ids = [
+            item_id
+            for item_id in self._drag_sibling_ids(mode, entry_id)
+            if item_id != entry_id
+        ]
+        allowed = self._drag_allowed_vertical_range(mode, entry_id)
+        if not remaining_ids or allowed is None:
+            return False, None
+        if not allowed[0] <= pointer_root_y <= allowed[1]:
+            return False, None
+
+        for item_id in remaining_ids:
+            block = self._drag_block_widgets(mode, item_id)
+            if not block:
+                continue
+            top = block[0].container.winfo_rooty()
+            bottom_widget = block[-1].container
+            bottom = bottom_widget.winfo_rooty() + bottom_widget.winfo_height()
+            if pointer_root_y < (top + bottom) / 2:
+                return True, item_id
+        return True, None
+
+    def _restore_drag_layout(self, mode: str) -> None:
+        state = self._row_drag
+        if state is not None and state.placeholder is not None:
+            if state.placeholder.winfo_exists():
+                state.placeholder.destroy()
+            state.placeholder = None
+        for row_index, widgets in enumerate(self._drag_widgets(mode)):
+            if widgets.container.winfo_exists():
+                widgets.container.grid(row=row_index, column=0, sticky="ew")
+
+    def _show_drag_preview(
+        self,
+        mode: str,
+        entry_id: str,
+        before_id: str | None,
+    ) -> None:
+        state = self._row_drag
+        if state is None:
+            return
+        self._restore_drag_layout(mode)
+        source_block = self._drag_block_widgets(mode, entry_id)
+        if not source_block:
+            return
+        source_frames = [widgets.container for widgets in source_block]
+        remaining_frames = [
+            widgets.container
+            for widgets in self._drag_widgets(mode)
+            if widgets.container not in source_frames
+        ]
+        if before_id is not None:
+            target_block = self._drag_block_widgets(mode, before_id)
+            if not target_block or target_block[0].container not in remaining_frames:
+                return
+            insert_index = remaining_frames.index(target_block[0].container)
+        else:
+            remaining_siblings = [
+                item_id
+                for item_id in self._drag_sibling_ids(mode, entry_id)
+                if item_id != entry_id
+            ]
+            if not remaining_siblings:
+                return
+            target_block = self._drag_block_widgets(mode, remaining_siblings[-1])
+            if not target_block or target_block[-1].container not in remaining_frames:
+                return
+            insert_index = remaining_frames.index(target_block[-1].container) + 1
+
+        for frame in source_frames:
+            frame.grid_remove()
+        for index, frame in enumerate(remaining_frames):
+            frame.grid(row=index if index < insert_index else index + 1, column=0, sticky="ew")
+
+        preview_height = max(
+            self.row_content_height,
+            sum(max(self.row_content_height, frame.winfo_height()) for frame in source_frames),
+        )
+        placeholder = tk.Frame(
+            self._drag_container(mode),
+            height=preview_height,
+            bg=COLOR_PRIMARY_SOFT,
+            highlightthickness=1,
+            highlightbackground=COLOR_PRIMARY,
+        )
+        placeholder.grid(row=insert_index, column=0, sticky="ew")
+        placeholder.grid_propagate(False)
+        placeholder.columnconfigure(0, weight=1)
+        placeholder.rowconfigure(0, weight=1)
+        tk.Label(
+            placeholder,
+            text="ここに移動",
+            bg=COLOR_PRIMARY_SOFT,
+            fg=COLOR_PRIMARY,
+            font=self.small_font,
+        ).grid(row=0, column=0)
+        state.placeholder = placeholder
+        state.target_valid = True
+        state.before_id = before_id
+        self.root.update_idletasks()
+
+    def _cancel_row_drag(self) -> None:
+        state = self._row_drag
+        if state is None:
+            return
+        self._restore_drag_layout(state.mode)
+        self._row_drag = None
+        self.root.configure(cursor="")
+
+    def _on_row_drag_escape(self, _event: tk.Event | None = None) -> str | None:
+        if self._row_drag is None:
+            return None
+        self._cancel_row_drag()
+        return "break"
+
+    def _on_row_drag_press(
+        self,
+        mode: str,
+        entry_id: str,
+        event: tk.Event,
+    ) -> str:
+        self._cancel_row_drag()
+        if self._drag_location(mode, entry_id) is None:
+            return "break"
+        if mode == "schedule":
+            self._select(entry_id)
+        else:
+            self._select_todo(entry_id)
+        self._row_drag = RowDragState(
+            mode,
+            entry_id,
+            event.x_root,
+            event.y_root,
+        )
+        return "break"
+
+    def _auto_scroll_row_drag(self, mode: str, pointer_root_y: int) -> None:
+        canvas = self._drag_canvas(mode)
+        scroll_region = canvas.bbox("all")
+        if scroll_region is None:
+            return
+        content_height = scroll_region[3] - scroll_region[1]
+        if content_height <= canvas.winfo_height():
+            canvas.yview_moveto(0.0)
+            return
+        top = canvas.winfo_rooty()
+        bottom = top + canvas.winfo_height()
+        first, last = canvas.yview()
+        if pointer_root_y < top + 28 and first > 0.0:
+            canvas.yview_scroll(-1, "units")
+        elif pointer_root_y > bottom - 28 and last < 1.0:
+            canvas.yview_scroll(1, "units")
+
+    def _on_row_drag_motion(
+        self,
+        mode: str,
+        entry_id: str,
+        event: tk.Event,
+    ) -> str:
+        state = self._row_drag
+        if state is None or state.mode != mode or state.entry_id != entry_id:
+            return "break"
+        distance = max(
+            abs(event.x_root - state.start_root_x),
+            abs(event.y_root - state.start_root_y),
+        )
+        if not state.active and distance < DRAG_START_THRESHOLD:
+            return "break"
+        state.active = True
+        self.root.configure(cursor="fleur")
+        self._auto_scroll_row_drag(mode, event.y_root)
+        self.root.update_idletasks()
+
+        if state.placeholder is not None and state.placeholder.winfo_exists():
+            preview_top = state.placeholder.winfo_rooty()
+            preview_bottom = preview_top + state.placeholder.winfo_height()
+            if preview_top <= event.y_root <= preview_bottom:
+                return "break"
+
+        valid, before_id = self._drag_destination(mode, entry_id, event.y_root)
+        if not valid:
+            self._restore_drag_layout(mode)
+            state.target_valid = False
+            state.before_id = None
+            return "break"
+        if state.target_valid and state.before_id == before_id and state.placeholder is not None:
+            return "break"
+        self._show_drag_preview(mode, entry_id, before_id)
+        return "break"
+
+    def _commit_row_reorder(
+        self,
+        mode: str,
+        entry_id: str,
+        before_id: str | None,
+    ) -> bool:
+        snapshot = self._snapshot_schedule()
+        reorder = reorder_entry if mode == "schedule" else reorder_todo
+        if not reorder(self.schedule, entry_id, before_id):
+            return False
+        saved = self._save_or_restore(snapshot)
+        if mode == "schedule":
+            self._rebuild_rows()
+        else:
+            self._rebuild_todo_rows()
+        return saved
+
+    def _on_row_drag_release(
+        self,
+        mode: str,
+        entry_id: str,
+        _event: tk.Event,
+    ) -> str:
+        state = self._row_drag
+        if state is None or state.mode != mode or state.entry_id != entry_id:
+            return "break"
+        should_commit = state.active and state.target_valid
+        before_id = state.before_id
+        self._restore_drag_layout(mode)
+        self._row_drag = None
+        self.root.configure(cursor="")
+        if should_commit:
+            self._commit_row_reorder(mode, entry_id, before_id)
         return "break"
 
     def _on_rows_container_configure(self, _event: tk.Event) -> None:
@@ -1536,6 +1945,8 @@ class ScheduleApp:
 
     # ----- row handling -----
     def _clear_rows(self) -> None:
+        if self._row_drag is not None and self._row_drag.mode == "schedule":
+            self._cancel_row_drag()
         for child in self.rows_container.winfo_children():
             child.destroy()
         self.row_widgets.clear()
@@ -1624,6 +2035,8 @@ class ScheduleApp:
     def _clear_todo_rows(self) -> None:
         if not hasattr(self, "todo_rows_container"):
             return
+        if self._row_drag is not None and self._row_drag.mode == "todo":
+            self._cancel_row_drag()
         for child in self.todo_rows_container.winfo_children():
             child.destroy()
         self.todo_row_widgets.clear()
@@ -1665,7 +2078,19 @@ class ScheduleApp:
 
         task_frame = tk.Frame(row, bg=base_bg)
         task_frame.grid(row=0, column=0, sticky="nsew", padx=(12, 8), pady=2)
-        task_frame.columnconfigure(1, weight=1)
+        task_frame.columnconfigure(2, weight=1)
+        drag_handle = tk.Label(
+            task_frame,
+            text=DRAG_HANDLE_TEXT,
+            width=2,
+            anchor="center",
+            bg=base_bg,
+            fg=COLOR_TEXT_MUTED,
+            font=self.header_font,
+            cursor="fleur",
+        )
+        drag_handle.grid(row=0, column=0, padx=(0, 2))
+        self._bind_row_drag_handle(drag_handle, "todo", entry_id)
         if is_child:
             children = parent.get("children", [])
             indicator_text = "└─" if children and children[-1]["id"] == entry_id else "├─"
@@ -1683,7 +2108,7 @@ class ScheduleApp:
             font=self.header_font,
             cursor="hand2" if todo.get("children") else "arrow",
         )
-        indicator.grid(row=0, column=0, padx=(18 if is_child else 0, 4))
+        indicator.grid(row=0, column=1, padx=(18 if is_child else 0, 4))
         if todo.get("children"):
             indicator.bind(
                 "<Button-1>",
@@ -1697,7 +2122,7 @@ class ScheduleApp:
             fg=COLOR_TEXT,
             font=self.task_font if is_child else self.parent_font,
         )
-        task_label.grid(row=0, column=1, sticky="nsew")
+        task_label.grid(row=0, column=2, sticky="nsew")
         task_label.bind("<Button-1>", lambda _event, item_id=entry_id: self._select_todo(item_id))
         task_label.bind("<Double-1>", lambda _event, item_id=entry_id: self._on_edit_todo(item_id))
 
@@ -1726,6 +2151,7 @@ class ScheduleApp:
                 entry_id,
                 row,
                 selection_bar,
+                drag_handle,
                 indicator,
                 task_label,
                 deadline_label,
@@ -1746,6 +2172,7 @@ class ScheduleApp:
             bg = COLOR_PRIMARY_SOFT if selected else widgets.base_bg
             widgets.container.configure(bg=bg)
             widgets.selection_bar.configure(bg=COLOR_PRIMARY if selected else bg)
+            widgets.drag_handle.configure(bg=bg)
             widgets.tree_indicator.configure(bg=bg)
             widgets.task_label.configure(bg=bg)
             widgets.deadline_label.configure(bg=bg)
@@ -1821,10 +2248,23 @@ class ScheduleApp:
 
         task_frame = tk.Frame(row, height=self.row_content_height, bg=base_bg)
         task_frame.grid(row=0, column=1, sticky="nsew", padx=(0, 8))
-        task_frame.columnconfigure(1, weight=1)
+        task_frame.columnconfigure(2, weight=1)
         task_frame.grid_propagate(False)
         task_frame.bind("<Button-1>", lambda _event, item_id=entry_id: self._select(item_id))
         task_frame.bind("<MouseWheel>", self._on_rows_mousewheel)
+
+        drag_handle = tk.Label(
+            task_frame,
+            text=DRAG_HANDLE_TEXT,
+            width=2,
+            anchor="center",
+            bg=base_bg,
+            fg=COLOR_TEXT_MUTED,
+            font=self.header_font,
+            cursor="fleur",
+        )
+        drag_handle.grid(row=0, column=0, padx=(2, 2))
+        self._bind_row_drag_handle(drag_handle, "schedule", entry_id)
 
         if is_child:
             children = parent.get("children", [])
@@ -1837,7 +2277,7 @@ class ScheduleApp:
                 fg=COLOR_BORDER,
                 font=self.task_font,
             )
-            tree_indicator.grid(row=0, column=0, sticky="w", padx=(22, 6))
+            tree_indicator.grid(row=0, column=1, sticky="w", padx=(22, 6))
             tree_indicator.bind(
                 "<Button-1>", lambda _event, item_id=entry_id: self._select(item_id)
             )
@@ -1855,7 +2295,7 @@ class ScheduleApp:
                 fg=COLOR_PRIMARY if has_children else COLOR_BORDER,
                 font=self.header_font,
             )
-            tree_indicator.grid(row=0, column=0, sticky="w", padx=(0, 4))
+            tree_indicator.grid(row=0, column=1, sticky="w", padx=(0, 4))
             if has_children:
                 tree_indicator.bind(
                     "<Button-1>",
@@ -1872,7 +2312,7 @@ class ScheduleApp:
             bg=base_bg,
             fg=COLOR_TEXT,
         )
-        task_label.grid(row=0, column=1, sticky="nsew")
+        task_label.grid(row=0, column=2, sticky="nsew")
         task_label.bind("<Button-1>", lambda _event, item_id=entry_id: self._select(item_id))
         task_label.bind("<Double-1>", lambda _event, item_id=entry_id: self._on_edit(item_id))
         task_label.bind("<MouseWheel>", self._on_rows_mousewheel)
@@ -1965,6 +2405,7 @@ class ScheduleApp:
                 entry_id,
                 row,
                 selection_bar,
+                drag_handle,
                 vis_label,
                 task_frame,
                 tree_indicator,
@@ -2040,6 +2481,7 @@ class ScheduleApp:
             widgets.selection_bar.configure(bg=COLOR_PRIMARY if is_selected else bg)
             widgets.visibility_label.configure(bg=visibility_bg)
             widgets.task_frame.configure(bg=bg)
+            widgets.drag_handle.configure(bg=bg)
             widgets.tree_indicator.configure(bg=bg)
             widgets.task_label.configure(bg=bg)
             widgets.progress_frame.configure(bg=bg)
@@ -2118,11 +2560,6 @@ class ScheduleApp:
         if location is None:
             return
         group = location.parent
-        if not messagebox.askyesno(
-            "TODOへ移動",
-            f"「{group['task']}」と配下の子タスク{len(group.get('children', []))}件をTODOへ移動しますか？",
-        ):
-            return
         snapshot = self._snapshot_schedule()
         moved = move_schedule_group_to_todos(self.schedule, group["id"])
         if moved is None:
@@ -2135,19 +2572,12 @@ class ScheduleApp:
             self.selected_todo_id = None
         self._rebuild_rows()
         self._rebuild_todo_rows()
-        if self.selected_todo_id:
-            self._switch_mode("todo")
 
     def _on_move_to_schedule(self) -> None:
         location = find_todo(self.schedule, self.selected_todo_id or "")
         if location is None:
             return
         group = location.parent
-        if not messagebox.askyesno(
-            "タスクへ移動",
-            f"「{group['task']}」と配下の子TODO {len(group.get('children', []))}件をタスクへ移動しますか？",
-        ):
-            return
         snapshot = self._snapshot_schedule()
         try:
             moved = move_todo_group_to_schedule(self.schedule, group["id"])
@@ -2164,8 +2594,6 @@ class ScheduleApp:
             self.selected_id = None
         self._rebuild_todo_rows()
         self._rebuild_rows()
-        if self.selected_id:
-            self._switch_mode("schedule")
 
     def _on_add_todo(self) -> None:
         self._open_todo_dialog("parent")
