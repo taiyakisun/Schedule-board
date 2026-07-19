@@ -83,6 +83,23 @@ TEXT_VALUE_MODE = "指定数値"
 COMPLETE_BUTTON_WIDTH = 8
 ROW_CONTENT_MIN_HEIGHT = 30
 ROW_CONTENT_DEFAULT_HEIGHT = 40
+
+
+def scale_header_row_positions(
+    height: int,
+    year_line_height: int,
+    detail_line_height: int,
+) -> tuple[int, int, int]:
+    """年・月の上端と日付の下端を、互いに重ならない3段として返す。"""
+    top_padding = 1
+    bottom_padding = 1
+    content_height = year_line_height + (detail_line_height * 2)
+    free_height = max(0, height - top_padding - bottom_padding - content_height)
+    gap = free_height // 2
+    year_top = top_padding
+    month_top = year_top + year_line_height + gap
+    day_bottom = height - bottom_padding
+    return year_top, month_top, day_bottom
 VISIBILITY_COLUMN_WIDTH = 82
 PROGRESS_COLUMN_MIN_WIDTH = 78
 PROGRESS_COLUMN_MAX_WIDTH = 220
@@ -1267,9 +1284,15 @@ class ScheduleApp:
             self.header_labels[text] = label
         self.task_header_label = self.header_labels[LABEL_TASK]
 
+        scale_header_height = max(
+            50,
+            self.header_font.metrics("linespace")
+            + (self.small_font.metrics("linespace") * 2)
+            + 10,
+        )
         self.scale_canvas = tk.Canvas(
             self.header,
-            height=50,
+            height=scale_header_height,
             highlightthickness=0,
             background=COLOR_HEADER,
         )
@@ -3153,9 +3176,11 @@ class ScheduleApp:
                     break
                 weekend += timedelta(days=7)
 
-        y_year = 12
-        y_month = height / 2
-        y_day = height - 3
+        y_year, y_month, y_day = scale_header_row_positions(
+            height,
+            self.header_font.metrics("linespace"),
+            self.small_font.metrics("linespace"),
+        )
 
         total_years = end_all.year - start_all.year + 1
         pixels_per_year = usable_w / total_years
@@ -3211,6 +3236,7 @@ class ScheduleApp:
                     (x0 + x1) / 2,
                     y_month,
                     text=f"{current_month.month}月",
+                    anchor="n",
                     fill=COLOR_TEXT_MUTED,
                     font=self.small_font,
                 )

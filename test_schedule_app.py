@@ -101,7 +101,9 @@ class ScheduleAppLogicTests(unittest.TestCase):
         app.current_jst_date = app_module.date(2026, 7, 15)
         app.row_widgets = []
         app.header_font = Mock()
+        app.header_font.metrics.return_value = 16
         app.small_font = Mock()
+        app.small_font.metrics.return_value = 14
         app._rebuild_rows = Mock()
         return app
 
@@ -579,6 +581,23 @@ class ScheduleAppLogicTests(unittest.TestCase):
         app._redraw_scale()
 
         app._redraw_all_gantt.assert_called_once_with()
+
+    def test_scale_header_rows_do_not_overlap(self) -> None:
+        year_line_height = 16
+        detail_line_height = 14
+        canvas_height = year_line_height + (detail_line_height * 2) + 10
+
+        year_top, month_top, day_bottom = app_module.scale_header_row_positions(
+            canvas_height,
+            year_line_height,
+            detail_line_height,
+        )
+
+        self.assertLessEqual(year_top + year_line_height, month_top)
+        self.assertLessEqual(
+            month_top + detail_line_height,
+            day_bottom - detail_line_height,
+        )
 
     def test_extreme_date_scale_limits_canvas_items_to_visible_resolution(self) -> None:
         app = self.make_app()

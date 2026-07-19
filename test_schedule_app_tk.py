@@ -152,6 +152,31 @@ class ScheduleAppTkTests(unittest.TestCase):
         self.assertFalse(self.app.schedule_toolbar.winfo_ismapped())
         self.assertTrue(self.app.todo_toolbar.winfo_ismapped())
 
+    def test_scale_year_month_and_day_labels_do_not_overlap(self) -> None:
+        self.app._redraw_scale()
+        self._pump()
+        canvas = self.app.scale_canvas
+        text_items = [item for item in canvas.find_all() if canvas.type(item) == "text"]
+
+        def item_for_text(text: str) -> int:
+            return next(
+                item for item in text_items if canvas.itemcget(item, "text") == text
+            )
+
+        year_bbox = canvas.bbox(item_for_text("2026"))
+        month_bbox = canvas.bbox(item_for_text("7月"))
+        day_bboxes = [
+            canvas.bbox(item)
+            for item in text_items
+            if canvas.itemcget(item, "text").isdigit()
+            and canvas.itemcget(item, "text") != "2026"
+        ]
+        self.assertIsNotNone(year_bbox)
+        self.assertIsNotNone(month_bbox)
+        self.assertTrue(day_bboxes)
+        self.assertLess(year_bbox[3], month_bbox[1])
+        self.assertLess(month_bbox[3], min(bbox[1] for bbox in day_bboxes if bbox))
+
     def test_columns_selection_and_collapse_stay_aligned(self) -> None:
         for width in (1050, 1280, 1600):
             self.root.geometry(f"{width}x720+20+20")
