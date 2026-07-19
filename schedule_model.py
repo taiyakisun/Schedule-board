@@ -4,7 +4,8 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 import copy
 import math
-from typing import Iterator
+from typing import Callable, Iterator
+import unicodedata
 from uuid import UUID, uuid4, uuid5
 
 
@@ -13,6 +14,31 @@ KIND_PARENT = "parent"
 KIND_CHILD = "child"
 PROGRESS_PERCENT = "percent"
 PROGRESS_VALUE = "value"
+SORT_NONE = "none"
+SCHEDULE_SORT_KEYS = frozenset(
+    {
+        SORT_NONE,
+        "task_asc",
+        "task_desc",
+        "progress_asc",
+        "progress_desc",
+        "started_asc",
+        "started_desc",
+        "delay_asc",
+        "delay_desc",
+        "start_asc",
+        "start_desc",
+    }
+)
+TODO_SORT_KEYS = frozenset(
+    {
+        SORT_NONE,
+        "task_asc",
+        "task_desc",
+        "deadline_asc",
+        "deadline_desc",
+    }
+)
 
 _ID_NAMESPACE = UUID("f14e52f8-e596-40f6-93e4-55f56962cf10")
 
@@ -162,13 +188,62 @@ def _entry_seed(prefix: str, index: int, raw: dict) -> str:
     )
 
 
+def _normalize_order_ids(raw: object) -> list[str]:
+    if not isinstance(raw, list):
+        return []
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in raw:
+        item_id = str(value).strip()
+        if item_id and item_id not in seen:
+            seen.add(item_id)
+            result.append(item_id)
+    return result
+
+
+def _normalize_order_snapshot(raw: object) -> dict | None:
+    if not isinstance(raw, dict):
+        return None
+    parents = _normalize_order_ids(raw.get("parents"))
+    children_raw = raw.get("children")
+    children = {}
+    if isinstance(children_raw, dict):
+        for parent_id, child_ids in children_raw.items():
+            normalized_parent_id = str(parent_id).strip()
+            if normalized_parent_id:
+                children[normalized_parent_id] = _normalize_order_ids(child_ids)
+    return {"parents": parents, "children": children}
+
+
 def _normalize_settings(raw: object) -> dict:
     settings = raw if isinstance(raw, dict) else {}
     try:
         row_height = int(settings.get("row_height", 40))
     except (TypeError, ValueError):
         row_height = 40
-    return {"row_height": max(30, min(72, row_height))}
+    schedule_sort = str(settings.get("schedule_sort", SORT_NONE))
+    if schedule_sort not in SCHEDULE_SORT_KEYS:
+        schedule_sort = SORT_NONE
+    todo_sort = str(settings.get("todo_sort", SORT_NONE))
+    if todo_sort not in TODO_SORT_KEYS:
+        todo_sort = SORT_NONE
+    schedule_original_order = _normalize_order_snapshot(
+        settings.get("schedule_original_order")
+    )
+    todo_original_order = _normalize_order_snapshot(
+        settings.get("todo_original_order")
+    )
+    if schedule_sort == SORT_NONE:
+        schedule_original_order = None
+    if todo_sort == SORT_NONE:
+        todo_original_order = None
+    return {
+        "row_height": max(30, min(72, row_height)),
+        "schedule_sort": schedule_sort,
+        "todo_sort": todo_sort,
+        "schedule_original_order": schedule_original_order,
+        "todo_original_order": todo_original_order,
+    }
 
 
 def _normalize_todo_source(raw: object) -> dict | None:
@@ -537,10 +612,145 @@ def started_date_for_progress(
     return _parse_date(current_date) if value > 0 else None
 
 
-def delay_days(entry: dict, current_date: date | datetime | str) -> int:
-    """Return delay after the planned end date using the caller's JST date."""
+def effective_started_date(entry: dict) -> date | None:
+    """Return the earliest child started date, or the entry's own when childless."""
 
+    children = entry.get("children", [])
+    if isinstance(children, list) and children:
+        child_dates = [
+            child_date
+            for child in children
+            if (child_date := effective_started_date(child)) is not None
+        ]
+        return min(child_dates) if child_dates else None
+    return _parse_optional_date(entry.get("started"))
+
+
+def delay_days(entry: dict, current_date: date | datetime | str) -> int:
+    """Return own delay, or the maximum child delay for a parent group."""
+
+    children = entry.get("children", [])
+    if isinstance(children, list) and children:
+        return max(delay_days(child, current_date) for child in children)
     return max(0, (_parse_date(current_date) - _parse_date(entry["end"])).days)
+
+
+def capture_group_order(groups: list[dict]) -> dict:
+    """Capture parent and per-parent child IDs without copying entry data."""
+
+    return {
+        "parents": [str(parent.get("id")) for parent in groups],
+        "children": {
+            str(parent.get("id")): [
+                str(child.get("id")) for child in parent.get("children", [])
+            ]
+            for parent in groups
+        },
+    }
+
+
+def _restore_sibling_order(siblings: list[dict], order_ids: list[str]) -> None:
+    rank = {item_id: index for index, item_id in enumerate(order_ids)}
+    siblings.sort(
+        key=lambda item: (
+            0,
+            rank[str(item.get("id"))],
+        )
+        if str(item.get("id")) in rank
+        else (1, 0)
+    )
+
+
+def restore_group_order(groups: list[dict], snapshot: object) -> bool:
+    """Restore known IDs and append new IDs in their current relative order."""
+
+    normalized = _normalize_order_snapshot(snapshot)
+    if normalized is None:
+        return False
+    before = capture_group_order(groups)
+    _restore_sibling_order(groups, normalized["parents"])
+    for parent in groups:
+        parent_id = str(parent.get("id"))
+        _restore_sibling_order(
+            parent.get("children", []),
+            normalized["children"].get(parent_id, []),
+        )
+    return capture_group_order(groups) != before
+
+
+def _task_sort_value(entry: dict) -> str:
+    return unicodedata.normalize("NFKC", str(entry.get("task", ""))).casefold()
+
+
+def _sort_siblings(
+    siblings: list[dict],
+    value_for: Callable[[dict], object | None],
+    reverse: bool,
+) -> None:
+    sortable: list[tuple[object, dict]] = []
+    missing: list[dict] = []
+    for item in siblings:
+        value = value_for(item)
+        if value is None:
+            missing.append(item)
+        else:
+            sortable.append((value, item))
+    sortable.sort(key=lambda pair: pair[0], reverse=reverse)
+    siblings[:] = [item for _value, item in sortable] + missing
+
+
+def _sort_group_tree(
+    groups: list[dict],
+    value_for: Callable[[dict], object | None],
+    reverse: bool,
+) -> bool:
+    before = capture_group_order(groups)
+    for parent in groups:
+        _sort_siblings(parent.get("children", []), value_for, reverse)
+    _sort_siblings(groups, value_for, reverse)
+    return capture_group_order(groups) != before
+
+
+def apply_schedule_sort(
+    schedule: dict,
+    sort_key: str,
+    current_date: date | datetime | str,
+) -> bool:
+    if sort_key == SORT_NONE:
+        return False
+    if sort_key not in SCHEDULE_SORT_KEYS:
+        raise ValueError(f"unsupported schedule sort: {sort_key}")
+    criterion, direction = sort_key.rsplit("_", 1)
+    reverse = direction == "desc"
+    if criterion == "task":
+        value_for = _task_sort_value
+    elif criterion == "progress":
+        value_for = progress_ratio
+    elif criterion == "started":
+        def value_for(entry: dict) -> date | None:
+            return effective_started_date(entry)
+    elif criterion == "delay":
+        def value_for(entry: dict) -> int:
+            return delay_days(entry, current_date)
+    else:
+        def value_for(entry: dict) -> date:
+            return _parse_date(entry["start"])
+    return _sort_group_tree(schedule.get("parents", []), value_for, reverse)
+
+
+def apply_todo_sort(schedule: dict, sort_key: str) -> bool:
+    if sort_key == SORT_NONE:
+        return False
+    if sort_key not in TODO_SORT_KEYS:
+        raise ValueError(f"unsupported todo sort: {sort_key}")
+    criterion, direction = sort_key.rsplit("_", 1)
+    reverse = direction == "desc"
+    if criterion == "task":
+        value_for = _task_sort_value
+    else:
+        def value_for(todo: dict) -> date:
+            return _parse_date(todo["deadline"])
+    return _sort_group_tree(schedule.get("todos", []), value_for, reverse)
 
 
 def _move_delta(direction: int | str) -> int:

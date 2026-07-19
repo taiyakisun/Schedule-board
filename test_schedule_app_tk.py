@@ -41,6 +41,7 @@ class ScheduleAppTkTests(unittest.TestCase):
             parent_id=parent["id"],
             entry_id="child-a",
             progress_value=60,
+            started="2026-07-16",
         )
         child_b = new_entry(
             KIND_CHILD,
@@ -50,6 +51,7 @@ class ScheduleAppTkTests(unittest.TestCase):
             parent_id=parent["id"],
             entry_id="child-b",
             progress_value=20,
+            started="2026-07-13",
         )
         parent["children"] = [child_a, child_b]
         self.parent = parent
@@ -83,6 +85,7 @@ class ScheduleAppTkTests(unittest.TestCase):
                 app_module.TEXT_DELETE,
                 app_module.TEXT_UP,
                 app_module.TEXT_DOWN,
+                app_module.TEXT_SORT,
                 app_module.TEXT_MORE,
             },
         )
@@ -91,7 +94,7 @@ class ScheduleAppTkTests(unittest.TestCase):
                 isinstance(control, ttk.Menubutton)
                 for control in self.app.toolbar_buttons.values()
             ),
-            2,
+            3,
         )
         add_menu = self.app.toolbar_buttons[app_module.TEXT_ADD_MENU].menu
         self.assertEqual(add_menu.entrycget(0, "label"), "親タスクを追加")
@@ -104,6 +107,7 @@ class ScheduleAppTkTests(unittest.TestCase):
                 app_module.TEXT_DELETE,
                 app_module.TEXT_UP,
                 app_module.TEXT_DOWN,
+                app_module.TEXT_SORT,
                 app_module.TEXT_SETTINGS,
             },
         )
@@ -112,6 +116,18 @@ class ScheduleAppTkTests(unittest.TestCase):
         )
         self.assertTrue(
             isinstance(self.app.toolbar_buttons[app_module.TEXT_DOWN], ttk.Button)
+        )
+        self.assertEqual(
+            self.app.schedule_sort_button.menu.entrycget(0, "label"),
+            "ソートなし",
+        )
+        self.assertEqual(
+            self.app.schedule_sort_button.menu.entrycget(10, "label"),
+            "開始日：降順",
+        )
+        self.assertEqual(
+            self.app.todo_sort_button.menu.entrycget(4, "label"),
+            "期限：降順",
         )
 
         task_font = self.app.task_font.actual()
@@ -130,7 +146,9 @@ class ScheduleAppTkTests(unittest.TestCase):
         self.assertEqual([row.tree_indicator.cget("text") for row in rows], ["▼", "├─", "└─"])
         self.assertEqual(rows[0].task_label.cget("font"), str(self.app.parent_font))
         self.assertEqual(rows[1].task_label.cget("font"), str(self.app.task_font))
-        self.assertEqual(rows[0].started_label.cget("text"), "07/14")
+        self.assertEqual(rows[0].started_label.cget("text"), "07/13")
+        self.assertEqual(rows[1].started_label.cget("text"), "07/16")
+        self.assertEqual(rows[2].started_label.cget("text"), "07/13")
         for row in rows:
             self.assertEqual(row.drag_handle.cget("text"), app_module.DRAG_HANDLE_TEXT)
             self.assertEqual(row.drag_handle.cget("cursor"), "fleur")
@@ -165,6 +183,49 @@ class ScheduleAppTkTests(unittest.TestCase):
         self.assertFalse(self.app.schedule_toolbar.winfo_ismapped())
         self.assertTrue(self.app.todo_toolbar.winfo_ismapped())
 
+    def test_list_move_buttons_are_separated_on_toolbar_right(self) -> None:
+        def assert_right_aligned(
+            toolbar: tk.Frame,
+            buttons: dict[str, tk.Widget],
+            move_key: str,
+        ) -> None:
+            move_button = buttons[move_key]
+            left_controls = [
+                control for key, control in buttons.items() if key != move_key
+            ]
+            for width in (1050, 1280):
+                with self.subTest(move_key=move_key, width=width):
+                    self.root.geometry(f"{width}x720+20+20")
+                    self._pump()
+                    left_edge = max(
+                        control.winfo_rootx() + control.winfo_width()
+                        for control in left_controls
+                    )
+                    toolbar_right = toolbar.winfo_rootx() + toolbar.winfo_width()
+
+                    self.assertGreater(move_button.winfo_rootx(), left_edge + 40)
+                    self.assertLessEqual(
+                        abs(
+                            move_button.winfo_rootx()
+                            + move_button.winfo_width()
+                            - toolbar_right
+                        ),
+                        2,
+                    )
+
+        assert_right_aligned(
+            self.app.schedule_toolbar,
+            self.app.toolbar_buttons,
+            app_module.TEXT_MOVE_TO_TODO,
+        )
+        self.app._switch_mode("todo")
+        self._pump()
+        assert_right_aligned(
+            self.app.todo_toolbar,
+            self.app.todo_toolbar_buttons,
+            app_module.TEXT_MOVE_TO_SCHEDULE,
+        )
+
     def test_moves_between_lists_keep_the_current_view(self) -> None:
         self.app.selected_id = self.child_a["id"]
 
@@ -183,6 +244,195 @@ class ScheduleAppTkTests(unittest.TestCase):
         self.assertEqual(self.app.active_mode, "todo")
         self.assertFalse(self.app.schedule_toolbar.winfo_ismapped())
         self.assertTrue(self.app.todo_toolbar.winfo_ismapped())
+
+    def test_row_context_menus_move_the_right_clicked_group(self) -> None:
+        schedule_row = next(
+            row for row in self.app.row_widgets if row.entry_id == self.child_a["id"]
+        )
+        self.assertTrue(schedule_row.container.bind("<Button-3>"))
+        self.assertTrue(schedule_row.task_label.bind("<Button-3>"))
+        self.assertTrue(schedule_row.gantt_canvas.bind("<Button-3>"))
+
+        schedule_event = SimpleNamespace(
+            x_root=schedule_row.task_label.winfo_rootx() + 4,
+            y_root=schedule_row.task_label.winfo_rooty() + 4,
+        )
+        with (
+            patch.object(self.app.schedule_row_menu, "tk_popup") as popup,
+            patch.object(self.app.schedule_row_menu, "grab_release") as release,
+        ):
+            result = self.app._show_row_context_menu(
+                "schedule",
+                self.child_a["id"],
+                schedule_event,
+            )
+
+        self.assertEqual(result, "break")
+        popup.assert_called_once_with(schedule_event.x_root, schedule_event.y_root)
+        release.assert_called_once_with()
+        self.assertEqual(self.app.selected_id, self.child_a["id"])
+        self.assertEqual(
+            self.app.schedule_row_menu.entrycget(0, "label"),
+            app_module.TEXT_MOVE_TO_TODO,
+        )
+        self.app.schedule_row_menu.invoke(0)
+        self._pump()
+
+        self.assertEqual(self.app.active_mode, "schedule")
+        self.assertEqual(self.app.entries, [])
+        self.assertEqual(self.app.todos[0]["id"], self.parent["id"])
+
+        self.app._switch_mode("todo")
+        self._pump()
+        todo_row = next(
+            row for row in self.app.todo_row_widgets if row.entry_id == self.child_a["id"]
+        )
+        self.assertTrue(todo_row.container.bind("<Button-3>"))
+        self.assertTrue(todo_row.task_label.bind("<Button-3>"))
+        self.assertTrue(todo_row.notify_button.bind("<Button-3>"))
+
+        todo_event = SimpleNamespace(
+            x_root=todo_row.task_label.winfo_rootx() + 4,
+            y_root=todo_row.task_label.winfo_rooty() + 4,
+        )
+        with (
+            patch.object(self.app.todo_row_menu, "tk_popup") as popup,
+            patch.object(self.app.todo_row_menu, "grab_release") as release,
+        ):
+            result = self.app._show_row_context_menu(
+                "todo",
+                self.child_a["id"],
+                todo_event,
+            )
+
+        self.assertEqual(result, "break")
+        popup.assert_called_once_with(todo_event.x_root, todo_event.y_root)
+        release.assert_called_once_with()
+        self.assertEqual(self.app.selected_todo_id, self.child_a["id"])
+        self.assertEqual(
+            self.app.todo_row_menu.entrycget(0, "label"),
+            app_module.TEXT_MOVE_TO_SCHEDULE,
+        )
+        self.app.todo_row_menu.invoke(0)
+        self._pump()
+
+        self.assertEqual(self.app.active_mode, "todo")
+        self.assertEqual(self.app.todos, [])
+        self.assertEqual(self.app.entries[0]["id"], self.parent["id"])
+
+    def test_sort_menus_restore_order_captured_before_first_sort(self) -> None:
+        first = new_entry(
+            KIND_PARENT,
+            "Gamma",
+            "2026-07-01",
+            "2026-07-31",
+            entry_id="sort-first",
+        )
+        second = new_entry(
+            KIND_PARENT,
+            "Alpha",
+            "2026-07-01",
+            "2026-07-31",
+            entry_id="sort-second",
+        )
+        third = new_entry(
+            KIND_PARENT,
+            "Beta",
+            "2026-07-01",
+            "2026-07-31",
+            entry_id="sort-third",
+        )
+        self.app.schedule = {
+            "version": 3,
+            "parents": [first, second, third],
+            "todos": [],
+            "settings": {"row_height": 40},
+        }
+        self.app._ensure_schedule_defaults()
+        self.app._rebuild_rows()
+
+        self.app.schedule_sort_button.menu.invoke(1)
+        self.app.schedule_sort_button.menu.invoke(2)
+        self._pump()
+
+        self.assertEqual(
+            [parent["id"] for parent in self.app.entries],
+            ["sort-first", "sort-third", "sort-second"],
+        )
+        self.assertEqual(
+            self.app.schedule["settings"]["schedule_original_order"]["parents"],
+            ["sort-first", "sort-second", "sort-third"],
+        )
+        self.assertEqual(self.app.schedule_sort_button.cget("text"), "ソート: タスク名 ↓")
+
+        self.app.selected_id = first["id"]
+        self.app._on_down()
+        self.app.schedule_sort_button.menu.invoke(0)
+        self._pump()
+
+        self.assertEqual(
+            [parent["id"] for parent in self.app.entries],
+            ["sort-first", "sort-second", "sort-third"],
+        )
+        self.assertIsNone(
+            self.app.schedule["settings"]["schedule_original_order"]
+        )
+        self.assertEqual(self.app.schedule_sort_button.cget("text"), "ソート: なし")
+
+        todo_first = new_todo_entry(
+            KIND_PARENT,
+            "Gamma",
+            "2026-07-30",
+            entry_id="todo-sort-first",
+        )
+        todo_second = new_todo_entry(
+            KIND_PARENT,
+            "Alpha",
+            "2026-07-10",
+            entry_id="todo-sort-second",
+        )
+        todo_third = new_todo_entry(
+            KIND_PARENT,
+            "Beta",
+            "2026-07-20",
+            entry_id="todo-sort-third",
+        )
+        self.app.schedule["todos"] = [todo_first, todo_second, todo_third]
+        self.app._ensure_schedule_defaults()
+        self.app._rebuild_todo_rows()
+        self.app.todo_sort_button.menu.invoke(1)
+        self._pump()
+
+        self.assertEqual(
+            [todo["id"] for todo in self.app.todos],
+            ["todo-sort-second", "todo-sort-third", "todo-sort-first"],
+        )
+        self.app.selected_todo_id = todo_second["id"]
+        self.app._move_selected_todo(1)
+        self.app.todo_sort_button.menu.invoke(0)
+        self._pump()
+
+        self.assertEqual(
+            [todo["id"] for todo in self.app.todos],
+            ["todo-sort-first", "todo-sort-second", "todo-sort-third"],
+        )
+        self.assertEqual(self.app.todo_sort_button.cget("text"), "ソート: なし")
+
+        self.app._save = Mock(return_value=False)
+        self.app.schedule_sort_button.menu.invoke(1)
+        self._pump()
+
+        self.assertEqual(
+            [parent["id"] for parent in self.app.entries],
+            ["sort-first", "sort-second", "sort-third"],
+        )
+        self.assertEqual(
+            self.app.schedule["settings"]["schedule_sort"],
+            app_module.SORT_NONE,
+        )
+        self.assertIsNone(
+            self.app.schedule["settings"]["schedule_original_order"]
+        )
 
     def test_separate_up_down_buttons_support_repeated_moves(self) -> None:
         child_c = new_entry(
@@ -652,6 +902,42 @@ class ScheduleAppTkTests(unittest.TestCase):
             if "<lambda>" in command or "refresh_progress_mode" in command
         ]
         self.assertEqual(leaked_callbacks, [])
+
+    def test_parent_with_children_shows_derived_started_date_as_read_only(self) -> None:
+        self.assertEqual(
+            self.app._completion_record(self.parent)[app_module.LOG_FIELD_STARTED],
+            "2026-07-13",
+        )
+        self.app._on_edit(self.parent["id"])
+        self._pump()
+
+        dialog = next(
+            widget
+            for widget in self.root.winfo_children()
+            if isinstance(widget, tk.Toplevel)
+        )
+        date_inputs = self._descendants_of_type(dialog, app_module.DateInput)
+        self.assertEqual(date_inputs[2].get_date(required=False).isoformat(), "2026-07-13")
+        self.assertEqual(
+            [str(entry.cget("state")) for entry in date_inputs[2].entries],
+            ["disabled", "disabled", "disabled"],
+        )
+        self.assertEqual(str(date_inputs[2].calendar_button.cget("state")), "disabled")
+        self.assertIn(
+            app_module.LABEL_STARTED_DATE_DERIVED,
+            [
+                label.cget("text")
+                for label in self._descendants_of_type(dialog, tk.Label)
+            ],
+        )
+
+        cancel = next(
+            button
+            for button in self._descendants_of_type(dialog, ttk.Button)
+            if button.cget("text") == app_module.BUTTON_CANCEL
+        )
+        cancel.invoke()
+        self._pump()
 
     def test_todo_tab_displays_hierarchy_and_notification_state(self) -> None:
         parent = new_todo_entry(

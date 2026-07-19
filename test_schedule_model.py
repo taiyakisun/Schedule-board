@@ -1,3 +1,4 @@
+import copy
 import unittest
 from datetime import date, datetime, timedelta, timezone
 
@@ -6,8 +7,12 @@ from schedule_model import (
     KIND_PARENT,
     PROGRESS_PERCENT,
     PROGRESS_VALUE,
+    apply_schedule_sort,
+    apply_todo_sort,
+    capture_group_order,
     delay_days,
     deserialize_schedule,
+    effective_started_date,
     effective_visible,
     find_entry,
     find_todo,
@@ -23,6 +28,7 @@ from schedule_model import (
     progress_ratio,
     progress_text,
     remove_entry,
+    restore_group_order,
     serialize_schedule,
     started_date_for_progress,
     todo_notification_due,
@@ -523,6 +529,241 @@ class ScheduleModelTests(unittest.TestCase):
         self.assertEqual(delay_days(entry, date(2026, 7, 11)), 1)
         self.assertEqual(delay_days(entry, datetime(2026, 7, 15, 23, 59)), 5)
         self.assertEqual(delay_days(entry, "2026-07-20"), 10)
+
+    def test_parent_uses_earliest_child_started_date_and_largest_child_delay(self) -> None:
+        parent = new_entry(
+            KIND_PARENT,
+            "Parent",
+            "2026-07-01",
+            "2026-07-31",
+            entry_id="parent-1",
+            started="2026-07-10",
+        )
+        parent["children"] = [
+            new_entry(
+                KIND_CHILD,
+                "Child A",
+                "2026-07-01",
+                "2026-07-19",
+                parent_id=parent["id"],
+                entry_id="child-a",
+                started="2026-07-20",
+            ),
+            new_entry(
+                KIND_CHILD,
+                "Child B",
+                "2026-07-01",
+                "2026-07-20",
+                parent_id=parent["id"],
+                entry_id="child-b",
+                started="2026-07-19",
+            ),
+            new_entry(
+                KIND_CHILD,
+                "Child C",
+                "2026-07-01",
+                "2026-07-25",
+                parent_id=parent["id"],
+                entry_id="child-c",
+            ),
+        ]
+
+        self.assertEqual(effective_started_date(parent), date(2026, 7, 19))
+        self.assertEqual(delay_days(parent, date(2026, 7, 26)), 7)
+
+        for child in parent["children"]:
+            child["started"] = None
+        self.assertIsNone(effective_started_date(parent))
+
+        parent["children"] = []
+        self.assertEqual(effective_started_date(parent), date(2026, 7, 10))
+        self.assertEqual(delay_days(parent, date(2026, 8, 2)), 2)
+
+    def test_schedule_sort_supports_every_condition_and_sorts_each_level(self) -> None:
+        first = new_entry(
+            KIND_PARENT,
+            "Beta",
+            "2026-07-05",
+            "2026-07-10",
+            entry_id="first",
+            progress_value=50,
+            started="2026-07-30",
+        )
+        first["children"] = [
+            new_entry(
+                KIND_CHILD,
+                "Zulu",
+                "2026-07-06",
+                "2026-07-09",
+                parent_id=first["id"],
+                entry_id="child-zulu",
+                progress_value=50,
+                started="2026-07-04",
+            ),
+            new_entry(
+                KIND_CHILD,
+                "alpha",
+                "2026-07-05",
+                "2026-07-08",
+                parent_id=first["id"],
+                entry_id="child-alpha",
+                progress_value=50,
+                started="2026-07-03",
+            ),
+        ]
+        second = new_entry(
+            KIND_PARENT,
+            "alpha",
+            "2026-07-01",
+            "2026-07-19",
+            entry_id="second",
+            progress_value=10,
+        )
+        third = new_entry(
+            KIND_PARENT,
+            "Gamma",
+            "2026-07-03",
+            "2026-07-25",
+            entry_id="third",
+            progress_value=90,
+            started="2026-07-10",
+        )
+        base = {"version": 3, "parents": [first, second, third], "todos": []}
+        expected = {
+            "task_asc": ["second", "first", "third"],
+            "task_desc": ["third", "first", "second"],
+            "progress_asc": ["second", "first", "third"],
+            "progress_desc": ["third", "first", "second"],
+            "started_asc": ["first", "third", "second"],
+            "started_desc": ["third", "first", "second"],
+            "delay_asc": ["third", "second", "first"],
+            "delay_desc": ["first", "second", "third"],
+            "start_asc": ["second", "third", "first"],
+            "start_desc": ["first", "third", "second"],
+        }
+
+        for sort_key, expected_ids in expected.items():
+            with self.subTest(sort_key=sort_key):
+                schedule = copy.deepcopy(base)
+                apply_schedule_sort(schedule, sort_key, date(2026, 7, 20))
+                self.assertEqual(
+                    [parent["id"] for parent in schedule["parents"]],
+                    expected_ids,
+                )
+                if sort_key == "task_asc":
+                    sorted_first = find_entry(schedule, "first").parent
+                    self.assertEqual(
+                        [child["id"] for child in sorted_first["children"]],
+                        ["child-alpha", "child-zulu"],
+                    )
+
+    def test_todo_sort_supports_name_and_deadline_in_both_directions(self) -> None:
+        todos = [
+            new_todo_entry(
+                KIND_PARENT,
+                "Beta",
+                "2026-07-20",
+                entry_id="first",
+            ),
+            new_todo_entry(
+                KIND_PARENT,
+                "alpha",
+                "2026-07-10",
+                entry_id="second",
+            ),
+            new_todo_entry(
+                KIND_PARENT,
+                "Gamma",
+                "2026-07-15",
+                entry_id="third",
+            ),
+        ]
+        todos[0]["children"] = [
+            new_todo_entry(
+                KIND_CHILD,
+                "Zulu",
+                "2026-07-22",
+                parent_id=todos[0]["id"],
+                entry_id="child-zulu",
+            ),
+            new_todo_entry(
+                KIND_CHILD,
+                "alpha",
+                "2026-07-21",
+                parent_id=todos[0]["id"],
+                entry_id="child-alpha",
+            ),
+        ]
+        base = {"version": 3, "parents": [], "todos": todos}
+        expected = {
+            "task_asc": ["second", "first", "third"],
+            "task_desc": ["third", "first", "second"],
+            "deadline_asc": ["second", "third", "first"],
+            "deadline_desc": ["first", "third", "second"],
+        }
+
+        for sort_key, expected_ids in expected.items():
+            with self.subTest(sort_key=sort_key):
+                schedule = copy.deepcopy(base)
+                apply_todo_sort(schedule, sort_key)
+                self.assertEqual(
+                    [todo["id"] for todo in schedule["todos"]],
+                    expected_ids,
+                )
+                if sort_key == "task_asc":
+                    sorted_first = find_todo(schedule, "first").parent
+                    self.assertEqual(
+                        [child["id"] for child in sorted_first["children"]],
+                        ["child-alpha", "child-zulu"],
+                    )
+
+    def test_original_order_survives_sort_manual_moves_and_round_trip(self) -> None:
+        first = self.make_parent("first", "Gamma")
+        first["children"] = [
+            self.make_child("child-zulu", first["id"], "Zulu"),
+            self.make_child("child-alpha", first["id"], "Alpha"),
+            self.make_child("child-middle", first["id"], "Middle"),
+        ]
+        second = self.make_parent("second", "Beta")
+        third = self.make_parent("third", "Alpha")
+        schedule = {
+            "version": 3,
+            "parents": [first, second, third],
+            "todos": [],
+            "settings": {"row_height": 40},
+        }
+        original = capture_group_order(schedule["parents"])
+        schedule["settings"].update(
+            {
+                "schedule_sort": "task_asc",
+                "schedule_original_order": original,
+            }
+        )
+
+        apply_schedule_sort(schedule, "task_asc", date(2026, 7, 20))
+        move_entry(schedule, "first", "up")
+        move_entry(schedule, "child-zulu", "up")
+        serialized = serialize_schedule(schedule)
+        restored = deserialize_schedule(serialized)
+
+        self.assertEqual(restored["settings"]["schedule_sort"], "task_asc")
+        self.assertEqual(
+            restored["settings"]["schedule_original_order"],
+            original,
+        )
+        restored["parents"].append(self.make_parent("new-parent", "New"))
+        restore_group_order(
+            restored["parents"],
+            restored["settings"]["schedule_original_order"],
+        )
+        self.assertEqual(
+            [parent["id"] for parent in restored["parents"]],
+            ["first", "second", "third", "new-parent"],
+        )
+        self.assertEqual(
+            [child["id"] for child in restored["parents"][0]["children"]],
+            ["child-zulu", "child-alpha", "child-middle"],
+        )
 
 
 if __name__ == "__main__":

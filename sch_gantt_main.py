@@ -12,8 +12,15 @@ from tkinter import filedialog, font as tkfont, messagebox, ttk
 from excel_export import export_to_excel
 from date_widgets import DateInput
 from schedule_model import (
+    SCHEDULE_SORT_KEYS,
+    SORT_NONE,
+    TODO_SORT_KEYS,
+    apply_schedule_sort,
+    apply_todo_sort,
+    capture_group_order,
     delay_days,
     deserialize_schedule,
+    effective_started_date,
     find_entry,
     find_todo,
     iter_all_todos,
@@ -30,6 +37,7 @@ from schedule_model import (
     progress_text,
     remove_entry,
     remove_todo,
+    restore_group_order,
     serialize_schedule,
     started_date_for_progress,
     todo_notification_due,
@@ -72,6 +80,7 @@ TEXT_RELOAD_INCOMPLETE = "未完了タスクの再読み込み"
 TEXT_MOVE_TO_TODO = "TODOへ移動"
 TEXT_MOVE_TO_SCHEDULE = "タスクへ移動"
 TEXT_SETTINGS = "表示設定"
+TEXT_SORT = "ソート"
 TEXT_ADD_MENU = "追加"
 TEXT_MORE = "その他"
 VISIBLE_TEXT = "表示"
@@ -88,6 +97,34 @@ ROW_CONTENT_MIN_HEIGHT = 30
 ROW_CONTENT_DEFAULT_HEIGHT = 40
 DRAG_HANDLE_TEXT = "↕"
 DRAG_START_THRESHOLD = 5
+
+SCHEDULE_SORT_OPTIONS = (
+    (SORT_NONE, "ソートなし", "なし"),
+    ("task_asc", "タスク名：昇順", "タスク名 ↑"),
+    ("task_desc", "タスク名：降順", "タスク名 ↓"),
+    ("progress_asc", "進捗度：昇順", "進捗度 ↑"),
+    ("progress_desc", "進捗度：降順", "進捗度 ↓"),
+    ("started_asc", "着手日：昇順", "着手日 ↑"),
+    ("started_desc", "着手日：降順", "着手日 ↓"),
+    ("delay_asc", "遅延日数：昇順", "遅延日数 ↑"),
+    ("delay_desc", "遅延日数：降順", "遅延日数 ↓"),
+    ("start_asc", "開始日：昇順", "開始日 ↑"),
+    ("start_desc", "開始日：降順", "開始日 ↓"),
+)
+TODO_SORT_OPTIONS = (
+    (SORT_NONE, "ソートなし", "なし"),
+    ("task_asc", "タスク名：昇順", "タスク名 ↑"),
+    ("task_desc", "タスク名：降順", "タスク名 ↓"),
+    ("deadline_asc", "期限：昇順", "期限 ↑"),
+    ("deadline_desc", "期限：降順", "期限 ↓"),
+)
+SCHEDULE_SORT_LABELS = {
+    sort_key: short_label
+    for sort_key, _menu_label, short_label in SCHEDULE_SORT_OPTIONS
+}
+TODO_SORT_LABELS = {
+    sort_key: short_label for sort_key, _menu_label, short_label in TODO_SORT_OPTIONS
+}
 
 
 def scale_header_row_positions(
@@ -118,6 +155,7 @@ LABEL_TASK_NAME = "タスク名"
 LABEL_START_DATE = "開始日 (YYYY-MM-DD)"
 LABEL_END_DATE = "終了日 (YYYY-MM-DD)"
 LABEL_STARTED_DATE = "着手日（未着手は空欄）"
+LABEL_STARTED_DATE_DERIVED = "着手日（子タスクの最古着手日から自動算出）"
 LABEL_PROGRESS_MODE = "進捗の単位"
 LABEL_PROGRESS_VALUE = "現在の進捗"
 LABEL_PROGRESS_TOTAL = "分母"
@@ -521,6 +559,7 @@ class ScheduleApp:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close_requested)
         self._load()
         self._ensure_schedule_defaults()
+        self._refresh_sort_controls()
         self.row_content_height = self._normalized_row_height(
             self.schedule["settings"].get("row_height", ROW_CONTENT_DEFAULT_HEIGHT)
         )
@@ -545,9 +584,29 @@ class ScheduleApp:
 
     def _ensure_schedule_defaults(self) -> None:
         self.schedule.setdefault("todos", [])
-        self.schedule.setdefault("settings", {"row_height": ROW_CONTENT_DEFAULT_HEIGHT})
+        settings = self.schedule.get("settings")
+        if not isinstance(settings, dict):
+            settings = {}
+            self.schedule["settings"] = settings
+        settings.setdefault("row_height", ROW_CONTENT_DEFAULT_HEIGHT)
+        if settings.get("schedule_sort") not in SCHEDULE_SORT_KEYS:
+            settings["schedule_sort"] = SORT_NONE
+        if settings.get("todo_sort") not in TODO_SORT_KEYS:
+            settings["todo_sort"] = SORT_NONE
+        settings.setdefault("schedule_original_order", None)
+        settings.setdefault("todo_original_order", None)
         self.entries = self.schedule["parents"]
         self.todos = self.schedule["todos"]
+        if (
+            settings["schedule_sort"] != SORT_NONE
+            and not isinstance(settings["schedule_original_order"], dict)
+        ):
+            settings["schedule_original_order"] = capture_group_order(self.entries)
+        if (
+            settings["todo_sort"] != SORT_NONE
+            and not isinstance(settings["todo_original_order"], dict)
+        ):
+            settings["todo_original_order"] = capture_group_order(self.todos)
 
     def _configure_theme(self) -> None:
         self.root.option_add("*Font", self.task_font)
@@ -847,6 +906,7 @@ class ScheduleApp:
         return False
 
     def _completion_record(self, entry: dict) -> dict:
+        started = effective_started_date(entry)
         return {
             LOG_FIELD_TASK: entry["task"],
             LOG_FIELD_START: format_date(entry["start"]),
@@ -860,9 +920,7 @@ class ScheduleApp:
             LOG_FIELD_PROGRESS_MODE: entry.get("progress_mode", "percent"),
             LOG_FIELD_PROGRESS_VALUE: entry.get("progress_value", 0),
             LOG_FIELD_PROGRESS_TOTAL: entry.get("progress_total", 100),
-            LOG_FIELD_STARTED: (
-                format_date(entry["started"]) if entry.get("started") else None
-            ),
+            LOG_FIELD_STARTED: format_date(started) if started else None,
         }
 
     def _completion_journal_path(self) -> str:
@@ -1071,6 +1129,65 @@ class ScheduleApp:
     def _delay_days(self, entry: dict) -> int:
         return delay_days(entry, self.current_jst_date)
 
+    def _started_date(self, entry: dict) -> date | None:
+        return effective_started_date(entry)
+
+    def _refresh_sort_controls(self) -> None:
+        settings = self.schedule["settings"]
+        if hasattr(self, "schedule_sort_button"):
+            schedule_key = settings.get("schedule_sort", SORT_NONE)
+            self.schedule_sort_button.configure(
+                text=f"ソート: {SCHEDULE_SORT_LABELS.get(schedule_key, 'なし')}"
+            )
+        if hasattr(self, "todo_sort_button"):
+            todo_key = settings.get("todo_sort", SORT_NONE)
+            self.todo_sort_button.configure(
+                text=f"ソート: {TODO_SORT_LABELS.get(todo_key, 'なし')}"
+            )
+
+    def _set_sort(self, mode: str, sort_key: str) -> None:
+        if mode == "schedule":
+            valid_keys = SCHEDULE_SORT_KEYS
+            groups = self.entries
+            sort_field = "schedule_sort"
+            order_field = "schedule_original_order"
+        elif mode == "todo":
+            valid_keys = TODO_SORT_KEYS
+            groups = self.todos
+            sort_field = "todo_sort"
+            order_field = "todo_original_order"
+        else:
+            return
+        if sort_key not in valid_keys:
+            return
+
+        settings = self.schedule["settings"]
+        current_sort = settings.get(sort_field, SORT_NONE)
+        if sort_key == SORT_NONE and current_sort == SORT_NONE:
+            self._refresh_sort_controls()
+            return
+
+        snapshot = self._snapshot_schedule()
+        if sort_key == SORT_NONE:
+            restore_group_order(groups, settings.get(order_field))
+            settings[sort_field] = SORT_NONE
+            settings[order_field] = None
+        else:
+            if current_sort == SORT_NONE:
+                settings[order_field] = capture_group_order(groups)
+            settings[sort_field] = sort_key
+            if mode == "schedule":
+                apply_schedule_sort(self.schedule, sort_key, self.current_jst_date)
+            else:
+                apply_todo_sort(self.schedule, sort_key)
+
+        self._save_or_restore(snapshot)
+        self._refresh_sort_controls()
+        if mode == "schedule":
+            self._rebuild_rows()
+        else:
+            self._rebuild_todo_rows()
+
     def _visibility_text(self, entry: dict, parent: dict) -> str:
         if not entry.get("visible", True):
             return HIDDEN_TEXT
@@ -1189,6 +1306,27 @@ class ScheduleApp:
             button.menu = menu
             return button
 
+        def create_sort_button(
+            parent: tk.Frame,
+            mode: str,
+            options: tuple[tuple[str, str, str], ...],
+        ) -> ttk.Menubutton:
+            menu = tk.Menu(parent, tearoff=False)
+            for sort_key, menu_label, _short_label in options:
+                menu.add_command(
+                    label=menu_label,
+                    command=lambda selected=sort_key: self._set_sort(mode, selected),
+                )
+            button = ttk.Menubutton(
+                parent,
+                text="ソート: なし",
+                menu=menu,
+                style="Secondary.TMenubutton",
+                cursor="hand2",
+            )
+            button.menu = menu
+            return button
+
         self.schedule_toolbar = tk.Frame(topbar, bg=COLOR_SURFACE)
         self.schedule_toolbar.grid(
             row=2, column=0, columnspan=2, sticky="ew", padx=20, pady=(10, 10)
@@ -1242,12 +1380,17 @@ class ScheduleApp:
             ),
             "Secondary.TMenubutton",
         )
+        self.schedule_sort_button = create_sort_button(
+            self.schedule_toolbar,
+            "schedule",
+            SCHEDULE_SORT_OPTIONS,
+        )
         schedule_controls = (
             (TEXT_ADD_MENU, schedule_add),
-            (TEXT_MOVE_TO_TODO, schedule_move),
             (TEXT_DELETE, schedule_delete),
             (TEXT_UP, schedule_up),
             (TEXT_DOWN, schedule_down),
+            (TEXT_SORT, self.schedule_sort_button),
             (TEXT_MORE, schedule_more),
         )
         for column, (key, control) in enumerate(schedule_controls):
@@ -1258,6 +1401,15 @@ class ScheduleApp:
                 padx=(0, 14 if column == 0 else 7),
             )
             self.toolbar_buttons[key] = control
+        spacer_column = len(schedule_controls)
+        self.schedule_toolbar.columnconfigure(spacer_column, weight=1)
+        schedule_move.grid(
+            row=0,
+            column=spacer_column + 1,
+            sticky="e",
+            padx=(14, 0),
+        )
+        self.toolbar_buttons[TEXT_MOVE_TO_TODO] = schedule_move
 
         self.todo_toolbar = tk.Frame(topbar, bg=COLOR_SURFACE)
         todo_add = create_menu_button(
@@ -1301,13 +1453,18 @@ class ScheduleApp:
             style="Secondary.TButton",
             cursor="hand2",
         )
+        self.todo_sort_button = create_sort_button(
+            self.todo_toolbar,
+            "todo",
+            TODO_SORT_OPTIONS,
+        )
         self.todo_toolbar_buttons: dict[str, tk.Widget] = {}
         todo_controls = (
             (TEXT_ADD_MENU, todo_add),
-            (TEXT_MOVE_TO_SCHEDULE, todo_move),
             (TEXT_DELETE, todo_delete),
             (TEXT_UP, todo_up),
             (TEXT_DOWN, todo_down),
+            (TEXT_SORT, self.todo_sort_button),
             (TEXT_SETTINGS, todo_settings),
         )
         for column, (key, control) in enumerate(todo_controls):
@@ -1318,6 +1475,26 @@ class ScheduleApp:
                 padx=(0, 14 if column == 0 else 7),
             )
             self.todo_toolbar_buttons[key] = control
+        spacer_column = len(todo_controls)
+        self.todo_toolbar.columnconfigure(spacer_column, weight=1)
+        todo_move.grid(
+            row=0,
+            column=spacer_column + 1,
+            sticky="e",
+            padx=(14, 0),
+        )
+        self.todo_toolbar_buttons[TEXT_MOVE_TO_SCHEDULE] = todo_move
+
+        self.schedule_row_menu = tk.Menu(self.root, tearoff=False)
+        self.schedule_row_menu.add_command(
+            label=TEXT_MOVE_TO_TODO,
+            command=self._on_move_to_todo,
+        )
+        self.todo_row_menu = tk.Menu(self.root, tearoff=False)
+        self.todo_row_menu.add_command(
+            label=TEXT_MOVE_TO_SCHEDULE,
+            command=self._on_move_to_schedule,
+        )
 
         self.header = tk.Frame(
             self.root,
@@ -1542,6 +1719,45 @@ class ScheduleApp:
     def _on_rows_mousewheel(self, event: tk.Event) -> str:
         if event.delta:
             self.rows_canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+        return "break"
+
+    def _bind_row_context_menu(
+        self,
+        widget: tk.Widget,
+        mode: str,
+        entry_id: str,
+    ) -> None:
+        widget.bind(
+            "<Button-3>",
+            lambda event, item_mode=mode, item_id=entry_id: self._show_row_context_menu(
+                item_mode,
+                item_id,
+                event,
+            ),
+        )
+
+    def _show_row_context_menu(
+        self,
+        mode: str,
+        entry_id: str,
+        event: tk.Event,
+    ) -> str:
+        if mode == "schedule":
+            if self._find(entry_id) is None:
+                return "break"
+            self._select(entry_id)
+            menu = self.schedule_row_menu
+        elif mode == "todo":
+            if find_todo(self.schedule, entry_id) is None:
+                return "break"
+            self._select_todo(entry_id)
+            menu = self.todo_row_menu
+        else:
+            return "break"
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
         return "break"
 
     # ----- drag and drop ordering -----
@@ -2146,6 +2362,17 @@ class ScheduleApp:
             command=lambda item_id=entry_id: self._toggle_todo_notification(item_id),
         )
         notify_button.grid(row=0, column=2, sticky="w", padx=(8, 12), pady=2)
+        for widget in (
+            row,
+            selection_bar,
+            task_frame,
+            drag_handle,
+            indicator,
+            task_label,
+            deadline_label,
+            notify_button,
+        ):
+            self._bind_row_context_menu(widget, "todo", entry_id)
         self.todo_row_widgets.append(
             TodoRowWidgets(
                 entry_id,
@@ -2349,7 +2576,7 @@ class ScheduleApp:
         )
         progress_canvas.bind("<MouseWheel>", self._on_rows_mousewheel)
 
-        started = entry.get("started")
+        started = self._started_date(entry)
         started_label = tk.Label(
             row,
             text=started.strftime("%m/%d") if isinstance(started, date) else "—",
@@ -2399,6 +2626,24 @@ class ScheduleApp:
         gantt_canvas.bind("<Button-1>", lambda _event, item_id=entry_id: self._select(item_id))
         gantt_canvas.bind("<Configure>", lambda _event, item_id=entry_id: self._redraw_gantt_for(item_id))
         gantt_canvas.bind("<MouseWheel>", self._on_rows_mousewheel)
+
+        for widget in (
+            row,
+            selection_bar,
+            vis_label,
+            task_frame,
+            drag_handle,
+            tree_indicator,
+            task_label,
+            progress_frame,
+            progress_label,
+            progress_canvas,
+            started_label,
+            delay_label,
+            complete_button,
+            gantt_canvas,
+        ):
+            self._bind_row_context_menu(widget, "schedule", entry_id)
 
         self.row_widgets.append(
             RowWidgets(
@@ -3018,6 +3263,12 @@ class ScheduleApp:
     ) -> None:
         location = self._find(entry_id)
         is_edit = location is not None
+        started_is_derived = bool(
+            is_edit
+            and location.is_parent
+            and location.entry.get("children")
+        )
+        stored_started = location.entry.get("started") if started_is_derived else None
         dialog_title = DIALOG_EDIT_TITLE
         if not is_edit:
             dialog_title = DIALOG_ADD_PARENT_TITLE if kind == "parent" else DIALOG_ADD_CHILD_TITLE
@@ -3067,7 +3318,11 @@ class ScheduleApp:
             task_var.set(entry["task"])
             initial_start = entry["start"]
             initial_end = entry["end"]
-            initial_started = entry.get("started")
+            initial_started = (
+                effective_started_date(entry)
+                if started_is_derived
+                else entry.get("started")
+            )
             progress_mode_var.set(entry.get("progress_mode", "percent"))
             progress_value_var.set(number_text(entry.get("progress_value", 0)))
             progress_total_var.set(number_text(entry.get("progress_total", 100)))
@@ -3131,7 +3386,11 @@ class ScheduleApp:
         end_input.grid(row=1, column=1, sticky="ew", padx=(8, 0))
         tk.Label(
             dates_frame,
-            text=LABEL_STARTED_DATE,
+            text=(
+                LABEL_STARTED_DATE_DERIVED
+                if started_is_derived
+                else LABEL_STARTED_DATE
+            ),
             bg=COLOR_SURFACE,
             fg=COLOR_TEXT_MUTED,
             font=self.header_font,
@@ -3144,6 +3403,7 @@ class ScheduleApp:
             background=COLOR_SURFACE,
         )
         started_input.grid(row=3, column=0, columnspan=2, sticky="ew")
+        started_input.set_enabled(not started_is_derived)
 
         tk.Label(
             form,
@@ -3258,7 +3518,11 @@ class ScheduleApp:
             try:
                 start_value = start_input.get_date()
                 end_value = end_input.get_date()
-                started_value = started_input.get_date(required=False)
+                started_value = (
+                    stored_started
+                    if started_is_derived
+                    else started_input.get_date(required=False)
+                )
             except ValueError:
                 messagebox.showerror(ERROR_INPUT_TITLE, ERROR_INVALID_DATE)
                 return
@@ -3283,11 +3547,12 @@ class ScheduleApp:
 
             clean_value: int | float = int(progress_value) if progress_value.is_integer() else progress_value
             clean_total: int | float = int(progress_total) if progress_total.is_integer() else progress_total
-            started_value = started_date_for_progress(
-                started_value,
-                clean_value,
-                self.current_jst_date,
-            )
+            if not started_is_derived:
+                started_value = started_date_for_progress(
+                    started_value,
+                    clean_value,
+                    self.current_jst_date,
+                )
             snapshot = self._snapshot_schedule()
             previous_selection = self.selected_id
             if is_edit:

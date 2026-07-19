@@ -193,6 +193,12 @@ class DateInput(tk.Frame):
         self.month_var.set(f"{value.month:02d}")
         self.day_var.set(f"{value.day:02d}")
 
+    def set_enabled(self, enabled: bool) -> None:
+        state = "normal" if enabled else "disabled"
+        for entry in self.entries:
+            entry.configure(state=state)
+        self.calendar_button.configure(state=state)
+
     def get_date(self, *, required: bool = True) -> date | None:
         parts = (self.year_var.get().strip(), self.month_var.get().strip(), self.day_var.get().strip())
         if not any(parts) and (self.allow_empty or not required):

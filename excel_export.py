@@ -14,6 +14,8 @@ import unicodedata
 import xml.etree.ElementTree as ET
 import zipfile
 
+from schedule_model import delay_days, effective_started_date
+
 
 SHEET_NAME = "ガントチャート"
 FIXED_COLUMN_COUNT = 7
@@ -184,10 +186,10 @@ def _normalize_rows(
                 ),
                 start=parent_start,
                 end=parent_end,
-                started=_optional_date(parent.get("started"), f"parents[{parent_index}].started"),
+                started=effective_started_date(parent),
                 effective_visible=parent_visible,
                 progress=parent_progress,
-                delay_days=max(0, (today - parent_end).days),
+                delay_days=delay_days(parent, today),
                 collapsed=bool(children) and not expanded,
             )
         )
@@ -205,10 +207,10 @@ def _normalize_rows(
                     tree_title=f"{branch} {child_title}",
                     start=child_start,
                     end=child_end,
-                    started=_optional_date(child.get("started"), f"{path}.started"),
+                    started=effective_started_date(child),
                     effective_visible=effective_visible,
                     progress=child_progresses[child_index],
-                    delay_days=max(0, (today - child_end).days),
+                    delay_days=delay_days(child, today),
                     hidden=not expanded,
                 )
             )

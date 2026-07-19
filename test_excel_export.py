@@ -35,6 +35,7 @@ class ExcelExportTests(unittest.TestCase):
                         "task": "子A-1",
                         "start": "2026-07-02",
                         "end": "2026-07-04",
+                        "started": "2026-07-03",
                         "visible": True,
                         "progress": {"mode": "custom", "current": 1, "total": 3},
                     },
@@ -42,6 +43,7 @@ class ExcelExportTests(unittest.TestCase):
                         "task": "子A-2",
                         "start": "2026-07-01",
                         "end": "2026-07-02",
+                        "started": "2026-07-01",
                         "visible": False,
                         "progress_current": 100,
                     },
@@ -124,12 +126,12 @@ class ExcelExportTests(unittest.TestCase):
         self.assertEqual(self._cell_value(cells["A4"]), "└─ 子A-2")
         self.assertNotIn("親A", self._cell_value(cells["A3"]))
         self.assertEqual(self._cell_value(cells["A5"]), "▾ 親B")
-        self.assertEqual(int(self._cell_value(cells["D2"])), 46205)
+        self.assertEqual(int(self._cell_value(cells["D2"])), 46204)
         self.assertEqual(self._cell_value(cells["E2"]), "67%")
         self.assertAlmostEqual(float(self._cell_value(cells["F2"])), 2 / 3)
         self.assertEqual(self._cell_value(cells["E5"]), "100%")
         self.assertEqual(float(self._cell_value(cells["F5"])), 1.0)
-        self.assertEqual(int(self._cell_value(cells["G2"])), 2)
+        self.assertEqual(int(self._cell_value(cells["G2"])), 3)
         self.assertEqual(int(self._cell_value(cells["H1"])), 46204)
 
         self.assertEqual(self._fill_color(cells["H2"], styles), "FF2E7D32")
