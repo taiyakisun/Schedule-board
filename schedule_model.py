@@ -157,6 +157,38 @@ def new_entry(
     return normalized
 
 
+def child_dates_within_parent(
+    parent: dict,
+    start: date | datetime | str,
+    end: date | datetime | str,
+) -> bool:
+    """Return whether a child date range is fully contained by its parent."""
+
+    parent_start = _parse_date(parent["start"])
+    parent_end = _parse_date(parent["end"])
+    child_start = _parse_date(start)
+    child_end = _parse_date(end)
+    return parent_start <= child_start <= child_end <= parent_end
+
+
+def clamp_children_to_parent(parent: dict) -> bool:
+    """Clamp every child range to the parent range in place."""
+
+    parent_start = _parse_date(parent["start"])
+    parent_end = _parse_date(parent["end"])
+    changed = False
+    for child in parent.get("children", []):
+        child_start = _parse_date(child["start"])
+        child_end = _parse_date(child["end"])
+        clamped_start = min(max(child_start, parent_start), parent_end)
+        clamped_end = min(max(child_end, parent_start), parent_end)
+        if clamped_start != child_start or clamped_end != child_end:
+            child["start"] = clamped_start
+            child["end"] = clamped_end
+            changed = True
+    return changed
+
+
 def _stable_id(seed: str) -> str:
     return str(uuid5(_ID_NAMESPACE, seed))
 
@@ -419,6 +451,7 @@ def _deserialize_v2(raw: dict) -> dict:
                 started=raw_child.get("started"),
             )
             parent["children"].append(child)
+        clamp_children_to_parent(parent)
         parents.append(parent)
     schedule = {"version": SCHEMA_VERSION, "parents": parents}
     if "todos" in raw:
@@ -504,10 +537,14 @@ def serialize_schedule(schedule: dict) -> dict:
     for parent in parents_raw:
         serialized_parent = _serialize_common(parent, KIND_PARENT, None)
         serialized_parent["collapsed"] = bool(parent.get("collapsed", False))
-        serialized_parent["children"] = [
-            _serialize_common(child, KIND_CHILD, serialized_parent["id"])
-            for child in parent.get("children", [])
-        ]
+        serialized_children = []
+        for child in parent.get("children", []):
+            if not child_dates_within_parent(parent, child["start"], child["end"]):
+                raise ValueError("child dates must be within parent dates")
+            serialized_children.append(
+                _serialize_common(child, KIND_CHILD, serialized_parent["id"])
+            )
+        serialized_parent["children"] = serialized_children
         parents.append(serialized_parent)
     serialized = {"version": SCHEMA_VERSION, "parents": parents}
     if "todos" in schedule:
@@ -627,7 +664,10 @@ def effective_started_date(entry: dict) -> date | None:
 
 
 def delay_days(entry: dict, current_date: date | datetime | str) -> int:
-    """Return own delay, or the maximum child delay for a parent group."""
+    """Return delay for unfinished work, aggregating the maximum child delay."""
+
+    if progress_ratio(entry) >= 1.0:
+        return 0
 
     children = entry.get("children", [])
     if isinstance(children, list) and children:
@@ -1011,6 +1051,7 @@ def _todo_to_entry(
             entry["children"].append(
                 _todo_to_entry(child_todo, KIND_CHILD, entry["id"])
             )
+        clamp_children_to_parent(entry)
     return entry
 
 

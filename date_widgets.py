@@ -98,9 +98,11 @@ class DateInput(tk.Frame):
         value: date | None = None,
         allow_empty: bool = False,
         background: str | None = None,
+        on_change: Callable[[date], None] | None = None,
     ) -> None:
         super().__init__(master, bg=background or master.cget("background"))
         self.allow_empty = allow_empty
+        self.on_change = on_change
         self.year_var = tk.StringVar()
         self.month_var = tk.StringVar()
         self.day_var = tk.StringVar()
@@ -123,6 +125,8 @@ class DateInput(tk.Frame):
             entry.bind("<minus>", lambda _event, index=column: self._advance(index))
             entry.bind("<slash>", lambda _event, index=column: self._advance(index))
             entry.bind("<<Paste>>", self._paste)
+            entry.bind("<KeyRelease>", self._notify_complete_date)
+            entry.bind("<FocusOut>", self._notify_date)
             entry.configure(
                 validate="key",
                 validatecommand=(
@@ -146,7 +150,7 @@ class DateInput(tk.Frame):
             command=self._open_calendar,
         )
         self.calendar_button.grid(row=0, column=6, padx=(8, 0))
-        self.set_date(value)
+        self.set_date(value, notify=False)
 
     @property
     def year_entry(self) -> ttk.Entry:
@@ -176,6 +180,25 @@ class DateInput(tk.Frame):
         self.set_date(value)
         return "break"
 
+    def _notify_complete_date(self, _event: tk.Event | None = None) -> None:
+        parts = (
+            self.year_var.get().strip(),
+            self.month_var.get().strip(),
+            self.day_var.get().strip(),
+        )
+        if tuple(map(len, parts)) == (4, 2, 2):
+            self._notify_date()
+
+    def _notify_date(self, _event: tk.Event | None = None) -> None:
+        if self.on_change is None:
+            return
+        try:
+            value = self.get_date(required=False)
+        except ValueError:
+            return
+        if value is not None:
+            self.on_change(value)
+
     def _open_calendar(self) -> None:
         try:
             initial = self.get_date(required=False) or date.today()
@@ -183,7 +206,7 @@ class DateInput(tk.Frame):
             initial = date.today()
         CalendarPopup(self.calendar_button, initial, self.set_date)
 
-    def set_date(self, value: date | None) -> None:
+    def set_date(self, value: date | None, *, notify: bool = True) -> None:
         if value is None:
             self.year_var.set("")
             self.month_var.set("")
@@ -192,6 +215,11 @@ class DateInput(tk.Frame):
         self.year_var.set(f"{value.year:04d}")
         self.month_var.set(f"{value.month:02d}")
         self.day_var.set(f"{value.day:02d}")
+        if notify:
+            self._notify_date()
+
+    def set_on_change(self, callback: Callable[[date], None] | None) -> None:
+        self.on_change = callback
 
     def set_enabled(self, enabled: bool) -> None:
         state = "normal" if enabled else "disabled"

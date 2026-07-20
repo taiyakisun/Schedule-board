@@ -18,6 +18,8 @@ from schedule_model import (
     apply_schedule_sort,
     apply_todo_sort,
     capture_group_order,
+    child_dates_within_parent,
+    clamp_children_to_parent,
     delay_days,
     deserialize_schedule,
     effective_started_date,
@@ -163,7 +165,7 @@ BUTTON_OK = "OK"
 BUTTON_CANCEL = "キャンセル"
 
 ERROR_INPUT_TITLE = "入力エラー"
-ERROR_END_BEFORE_START = "終了日は開始日以降を指定してください。"
+ERROR_CHILD_OUTSIDE_PARENT = "子スケジュールの開始日と終了日は、親スケジュールの期間内で指定してください。"
 ERROR_EMPTY_TASK = "タスク名を入力してください。"
 ERROR_INVALID_DATE = "日付はYYYY-MM-DD形式で入力してください。"
 ERROR_INVALID_PROGRESS = "進捗は0以上の数値で入力してください。"
@@ -551,7 +553,6 @@ class ScheduleApp:
         self._drag_start_x: int | None = None
         self._drag_start_width: int | None = None
         self.current_jst_date = today_in_jst()
-        self.today_label_screen_x: float | None = None
 
         self._build_ui()
         self.root.bind("<Escape>", self._on_row_drag_escape, add="+")
@@ -778,6 +779,17 @@ class ScheduleApp:
             callback()
 
         after_id = self.root.after(delay_ms, run_callback)
+        self._after_ids.add(after_id)
+        return after_id
+
+    def _schedule_after_idle(self, callback) -> str:
+        after_id = ""
+
+        def run_callback() -> None:
+            self._after_ids.discard(after_id)
+            callback()
+
+        after_id = self.root.after_idle(run_callback)
         self._after_ids.add(after_id)
         return after_id
 
@@ -1651,15 +1663,11 @@ class ScheduleApp:
         self.todo_rows_container.columnconfigure(0, weight=1)
         self.todo_rows_container.bind(
             "<Configure>",
-            lambda _event: self.todo_rows_canvas.configure(
-                scrollregion=self.todo_rows_canvas.bbox("all")
-            ),
+            lambda _event: self._update_canvas_scrollregion(self.todo_rows_canvas),
         )
         self.todo_rows_canvas.bind(
             "<Configure>",
-            lambda event: self.todo_rows_canvas.itemconfigure(
-                self.todo_rows_window, width=event.width
-            ),
+            self._on_todo_rows_canvas_configure,
         )
         self.todo_rows_canvas.bind("<MouseWheel>", self._on_todo_mousewheel)
         self.todo_rows_container.bind("<MouseWheel>", self._on_todo_mousewheel)
@@ -1713,12 +1721,18 @@ class ScheduleApp:
 
     def _on_todo_mousewheel(self, event: tk.Event) -> str:
         if event.delta:
-            self.todo_rows_canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+            if self._canvas_content_fits(self.todo_rows_canvas):
+                self.todo_rows_canvas.yview_moveto(0.0)
+            else:
+                self.todo_rows_canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
         return "break"
 
     def _on_rows_mousewheel(self, event: tk.Event) -> str:
         if event.delta:
-            self.rows_canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+            if self._canvas_content_fits(self.rows_canvas):
+                self.rows_canvas.yview_moveto(0.0)
+            else:
+                self.rows_canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
         return "break"
 
     def _bind_row_context_menu(
@@ -2094,12 +2108,30 @@ class ScheduleApp:
         return "break"
 
     def _on_rows_container_configure(self, _event: tk.Event) -> None:
-        self.rows_canvas.configure(scrollregion=self.rows_canvas.bbox("all"))
+        self._update_canvas_scrollregion(self.rows_canvas)
         self._redraw_all_gantt()
 
     def _on_rows_canvas_configure(self, event: tk.Event) -> None:
         self.rows_canvas.itemconfigure(self.rows_window, width=event.width)
+        self._update_canvas_scrollregion(self.rows_canvas)
         self._redraw_all_gantt()
+
+    def _on_todo_rows_canvas_configure(self, event: tk.Event) -> None:
+        self.todo_rows_canvas.itemconfigure(self.todo_rows_window, width=event.width)
+        self._update_canvas_scrollregion(self.todo_rows_canvas)
+
+    @staticmethod
+    def _canvas_content_fits(canvas: tk.Canvas) -> bool:
+        bounds = canvas.bbox("all")
+        if bounds is None:
+            return True
+        return bounds[3] - bounds[1] <= canvas.winfo_height()
+
+    def _update_canvas_scrollregion(self, canvas: tk.Canvas) -> None:
+        bounds = canvas.bbox("all")
+        canvas.configure(scrollregion=bounds or (0, 0, 0, 0))
+        if self._canvas_content_fits(canvas):
+            canvas.yview_moveto(0.0)
 
     def _apply_column_width(self) -> None:
         self.header.columnconfigure(0, minsize=VISIBILITY_COLUMN_WIDTH)
@@ -2181,6 +2213,9 @@ class ScheduleApp:
         self._refresh_delay_labels()
         self._redraw_all_gantt()
         self._redraw_scale()
+        self._schedule_after_idle(
+            lambda: self._update_canvas_scrollregion(self.rows_canvas)
+        )
 
     def _update_summary_label(self) -> None:
         if not hasattr(self, "summary_label"):
@@ -2276,6 +2311,9 @@ class ScheduleApp:
             empty.grid(row=0, column=0, sticky="ew")
         self._refresh_todo_selection()
         self._update_summary_label()
+        self._schedule_after_idle(
+            lambda: self._update_canvas_scrollregion(self.todo_rows_canvas)
+        )
 
     def _add_todo_row(self, row_index: int, todo: dict, parent: dict) -> None:
         entry_id = todo["id"]
@@ -2987,6 +3025,7 @@ class ScheduleApp:
             )
             if requested_kind == "child":
                 parent_location.entry.setdefault("children", []).append(entry)
+                clamp_children_to_parent(parent_location.entry)
             else:
                 self.entries.append(entry)
             existing_ids.add(entry["id"])
@@ -3382,6 +3421,42 @@ class ScheduleApp:
             value=initial_end,
             background=COLOR_SURFACE,
         )
+        last_changed_date = "start"
+
+        def start_date_changed(value: date) -> None:
+            nonlocal last_changed_date
+            last_changed_date = "start"
+            try:
+                end_value = end_input.get_date()
+            except ValueError:
+                return
+            if value > end_value:
+                end_input.set_date(value, notify=False)
+
+        def end_date_changed(value: date) -> None:
+            nonlocal last_changed_date
+            last_changed_date = "end"
+            try:
+                start_value = start_input.get_date()
+            except ValueError:
+                return
+            if value < start_value:
+                start_input.set_date(value, notify=False)
+
+        def mark_start_changed(_event: tk.Event) -> None:
+            nonlocal last_changed_date
+            last_changed_date = "start"
+
+        def mark_end_changed(_event: tk.Event) -> None:
+            nonlocal last_changed_date
+            last_changed_date = "end"
+
+        start_input.set_on_change(start_date_changed)
+        end_input.set_on_change(end_date_changed)
+        for entry in start_input.entries:
+            entry.bind("<KeyPress>", mark_start_changed, add="+")
+        for entry in end_input.entries:
+            entry.bind("<KeyPress>", mark_end_changed, add="+")
         start_input.grid(row=1, column=0, sticky="ew", padx=(0, 8))
         end_input.grid(row=1, column=1, sticky="ew", padx=(8, 0))
         tk.Label(
@@ -3527,8 +3602,29 @@ class ScheduleApp:
                 messagebox.showerror(ERROR_INPUT_TITLE, ERROR_INVALID_DATE)
                 return
             if end_value < start_value:
-                messagebox.showerror(ERROR_INPUT_TITLE, ERROR_END_BEFORE_START)
-                return
+                if last_changed_date == "end":
+                    start_value = end_value
+                    start_input.set_date(start_value, notify=False)
+                else:
+                    end_value = start_value
+                    end_input.set_date(end_value, notify=False)
+
+            parent_location = None
+            if kind == "child":
+                parent_location = self._find(parent_id)
+                if parent_location is None or not parent_location.is_parent:
+                    messagebox.showerror(ERROR_INPUT_TITLE, WARNING_SELECT_PARENT_MESSAGE)
+                    return
+                if not child_dates_within_parent(
+                    parent_location.entry,
+                    start_value,
+                    end_value,
+                ):
+                    messagebox.showerror(
+                        ERROR_INPUT_TITLE,
+                        ERROR_CHILD_OUTSIDE_PARENT,
+                    )
+                    return
             try:
                 progress_value = float(progress_value_var.get().strip())
                 progress_total = 100.0 if progress_mode_var.get() == "percent" else float(progress_total_var.get().strip())
@@ -3572,6 +3668,8 @@ class ScheduleApp:
                         "started": started_value,
                     }
                 )
+                if current_location.is_parent:
+                    clamp_children_to_parent(target)
                 self.selected_id = target["id"]
             else:
                 target = new_entry(
@@ -3588,10 +3686,6 @@ class ScheduleApp:
                 if kind == "parent":
                     self.entries.append(target)
                 else:
-                    parent_location = self._find(parent_id)
-                    if parent_location is None:
-                        messagebox.showerror(ERROR_INPUT_TITLE, WARNING_SELECT_PARENT_MESSAGE)
-                        return
                     parent_location.entry.setdefault("children", []).append(target)
                     parent_location.entry["collapsed"] = False
                 self.selected_id = target["id"]
@@ -3749,11 +3843,8 @@ class ScheduleApp:
 
         x_today = None
         if start_all <= self.current_jst_date <= end_all:
-            if self.today_label_screen_x is not None:
-                x_today = self.today_label_screen_x - canvas.winfo_rootx()
-            else:
-                today_index = (self.current_jst_date - start_all).days + 0.5
-                x_today = x_for(today_index)
+            today_index = (self.current_jst_date - start_all).days
+            x_today = x_for(today_index)
             canvas.create_rectangle(
                 max(0, x_today - max(3, pixels_per_day / 2)),
                 0,
@@ -3826,7 +3917,6 @@ class ScheduleApp:
             return
         canvas = self.scale_canvas
         canvas.delete("all")
-        self.today_label_screen_x = None
 
         width = canvas.winfo_width()
         height = canvas.winfo_height()
@@ -3954,7 +4044,6 @@ class ScheduleApp:
             if day_value == self.current_jst_date:
                 bbox = canvas.bbox(label)
                 if bbox:
-                    self.today_label_screen_x = canvas.winfo_rootx() + ((bbox[0] + bbox[2]) / 2)
                     highlight = create_rounded_rectangle(
                         canvas,
                         bbox[0] - 2,

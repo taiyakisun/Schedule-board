@@ -10,6 +10,8 @@ from schedule_model import (
     apply_schedule_sort,
     apply_todo_sort,
     capture_group_order,
+    child_dates_within_parent,
+    clamp_children_to_parent,
     delay_days,
     deserialize_schedule,
     effective_started_date,
@@ -55,6 +57,72 @@ class ScheduleModelTests(unittest.TestCase):
             parent_id=parent_id,
             entry_id=entry_id,
         )
+
+    def test_child_ranges_are_clamped_to_parent_boundaries(self) -> None:
+        parent = new_entry(
+            KIND_PARENT,
+            "Parent",
+            "2026-07-10",
+            "2026-07-20",
+            entry_id="parent-1",
+        )
+        ranges = (
+            ("2026-07-01", "2026-07-05", "2026-07-10", "2026-07-10"),
+            ("2026-07-05", "2026-07-12", "2026-07-10", "2026-07-12"),
+            ("2026-07-12", "2026-07-18", "2026-07-12", "2026-07-18"),
+            ("2026-07-18", "2026-07-25", "2026-07-18", "2026-07-20"),
+            ("2026-07-25", "2026-07-30", "2026-07-20", "2026-07-20"),
+            ("2026-07-01", "2026-07-30", "2026-07-10", "2026-07-20"),
+        )
+        parent["children"] = [
+            new_entry(
+                KIND_CHILD,
+                f"Child {index}",
+                start,
+                end,
+                parent_id=parent["id"],
+                entry_id=f"child-{index}",
+            )
+            for index, (start, end, _expected_start, _expected_end) in enumerate(ranges)
+        ]
+
+        self.assertTrue(clamp_children_to_parent(parent))
+        self.assertEqual(
+            [(child["start"].isoformat(), child["end"].isoformat()) for child in parent["children"]],
+            [(expected_start, expected_end) for _start, _end, expected_start, expected_end in ranges],
+        )
+        self.assertFalse(clamp_children_to_parent(parent))
+        self.assertTrue(
+            all(
+                child_dates_within_parent(parent, child["start"], child["end"])
+                for child in parent["children"]
+            )
+        )
+
+    def test_deserialize_repairs_child_range_outside_parent(self) -> None:
+        schedule = deserialize_schedule(
+            {
+                "version": 3,
+                "parents": [
+                    {
+                        "task": "Parent",
+                        "start": "2026-07-10",
+                        "end": "2026-07-20",
+                        "children": [
+                            {
+                                "task": "Child",
+                                "start": "2026-07-01",
+                                "end": "2026-07-25",
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+
+        child = schedule["parents"][0]["children"][0]
+        self.assertEqual(child["start"], date(2026, 7, 10))
+        self.assertEqual(child["end"], date(2026, 7, 20))
 
     def test_legacy_entries_migrate_to_childless_parents_with_stable_ids(self) -> None:
         legacy = {
@@ -530,6 +598,9 @@ class ScheduleModelTests(unittest.TestCase):
         self.assertEqual(delay_days(entry, datetime(2026, 7, 15, 23, 59)), 5)
         self.assertEqual(delay_days(entry, "2026-07-20"), 10)
 
+        entry["progress_value"] = 100
+        self.assertEqual(delay_days(entry, "2026-07-20"), 0)
+
     def test_parent_uses_earliest_child_started_date_and_largest_child_delay(self) -> None:
         parent = new_entry(
             KIND_PARENT,
@@ -570,6 +641,9 @@ class ScheduleModelTests(unittest.TestCase):
 
         self.assertEqual(effective_started_date(parent), date(2026, 7, 19))
         self.assertEqual(delay_days(parent, date(2026, 7, 26)), 7)
+
+        parent["children"][0]["progress_value"] = 100
+        self.assertEqual(delay_days(parent, date(2026, 7, 26)), 6)
 
         for child in parent["children"]:
             child["started"] = None

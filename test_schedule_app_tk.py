@@ -819,6 +819,97 @@ class ScheduleAppTkTests(unittest.TestCase):
         self.assertEqual(len(self.app.row_widgets), 1)
         self.assertEqual(self.app.row_widgets[0].tree_indicator.cget("text"), "▶")
 
+    def test_today_line_stays_aligned_after_window_move_and_row_redraw(self) -> None:
+        self.app.current_jst_date = app_module.date(2026, 7, 15)
+        self.app._redraw_scale()
+        self._pump()
+
+        self.root.geometry("1280x720+260+20")
+        self._pump()
+        row = self.app.row_widgets[0]
+        self.app._redraw_gantt_for(row.entry_id)
+
+        today_label = next(
+            item
+            for item in self.app.scale_canvas.find_all()
+            if self.app.scale_canvas.type(item) == "text"
+            and self.app.scale_canvas.itemcget(item, "text") == "15"
+            and self.app.scale_canvas.itemcget(item, "fill") == "white"
+        )
+        label_box = self.app.scale_canvas.bbox(today_label)
+        self.assertIsNotNone(label_box)
+        header_x = self.app.scale_canvas.winfo_rootx() + (
+            label_box[0] + label_box[2]
+        ) / 2
+        today_line = next(
+            item
+            for item in row.gantt_canvas.find_all()
+            if row.gantt_canvas.type(item) == "line"
+            and row.gantt_canvas.itemcget(item, "fill").upper()
+            == app_module.TODAY_LINE_COLOR
+        )
+        line_x = row.gantt_canvas.winfo_rootx() + row.gantt_canvas.coords(today_line)[0]
+        self.assertLessEqual(abs(header_x - line_x), 2)
+
+    def test_short_schedule_list_stays_at_top_when_mousewheel_is_used(self) -> None:
+        for delta in (-120, 120):
+            self.app._on_rows_mousewheel(SimpleNamespace(delta=delta))
+            self._pump()
+            self.assertAlmostEqual(self.app.rows_canvas.yview()[0], 0.0, places=3)
+            self.assertLessEqual(
+                abs(
+                    self.app.row_widgets[0].container.winfo_rooty()
+                    - self.app.rows_canvas.winfo_rooty()
+                ),
+                2,
+            )
+
+    def test_rebuilding_a_long_list_as_short_resets_scroll_to_top(self) -> None:
+        parents = [
+            new_entry(
+                KIND_PARENT,
+                f"親タスク {index + 1}",
+                "2026-07-01",
+                "2026-07-31",
+                entry_id=f"long-parent-{index}",
+            )
+            for index in range(45)
+        ]
+        self.app.schedule = {"version": 3, "parents": parents, "todos": []}
+        self.app._ensure_schedule_defaults()
+        self.app._rebuild_rows()
+        self._pump()
+        self.app.rows_canvas.yview_moveto(1.0)
+        self._pump()
+        self.assertAlmostEqual(self.app.rows_canvas.yview()[1], 1.0, places=3)
+
+        self.app.schedule = {
+            "version": 3,
+            "parents": [self.parent],
+            "todos": [],
+            "settings": {"row_height": 40},
+        }
+        self.app._ensure_schedule_defaults()
+        self.app._rebuild_rows()
+        self._pump()
+
+        scroll_region = tuple(
+            float(value)
+            for value in self.app.rows_canvas.cget("scrollregion").split()
+        )
+        self.assertLessEqual(
+            scroll_region[3] - scroll_region[1],
+            self.app.rows_canvas.winfo_height(),
+        )
+        self.assertAlmostEqual(self.app.rows_canvas.yview()[0], 0.0, places=3)
+        self.assertLessEqual(
+            abs(
+                self.app.row_widgets[0].container.winfo_rooty()
+                - self.app.rows_canvas.winfo_rooty()
+            ),
+            2,
+        )
+
     def _row_splitter_x(self, widgets: app_module.RowWidgets) -> int:
         column_box = widgets.container.grid_bbox(6, 0, 6, 0)
         return widgets.container.winfo_rootx() + column_box[0]
@@ -876,6 +967,156 @@ class ScheduleAppTkTests(unittest.TestCase):
         cancel_buttons[0].invoke()
         self._pump()
         self.assertFalse(dialog.winfo_exists())
+
+    def test_parent_and_child_date_inputs_keep_start_before_end(self) -> None:
+        for kind, parent_id in (("parent", None), ("child", self.parent["id"])):
+            with self.subTest(kind=kind):
+                self.app._open_entry_dialog(kind=kind, parent_id=parent_id)
+                self._pump()
+                dialog = next(
+                    widget
+                    for widget in self.root.winfo_children()
+                    if isinstance(widget, tk.Toplevel)
+                )
+                date_inputs = self._descendants_of_type(dialog, app_module.DateInput)
+                start_input, end_input = date_inputs[:2]
+
+                start_input.set_date(app_module.date(2026, 8, 5))
+                self.assertEqual(end_input.get_date(), app_module.date(2026, 8, 5))
+
+                end_input.set_date(app_module.date(2026, 7, 20))
+                self.assertEqual(start_input.get_date(), app_module.date(2026, 7, 20))
+
+                end_input.set_date(app_module.date(2026, 7, 25))
+                start_input.day_entry.focus_set()
+                self._pump()
+                start_input.day_entry.delete(0, "end")
+                start_input.day_entry.insert(0, "30")
+                end_input.year_entry.focus_set()
+                start_input.day_entry.event_generate("<FocusOut>")
+                self._pump()
+                self.assertEqual(end_input.get_date(), app_module.date(2026, 7, 30))
+
+                end_input.day_entry.focus_set()
+                self._pump()
+                end_input.day_entry.delete(0, "end")
+                end_input.day_entry.insert(0, "10")
+                start_input.year_entry.focus_set()
+                end_input.day_entry.event_generate("<FocusOut>")
+                self._pump()
+                self.assertEqual(start_input.get_date(), app_module.date(2026, 7, 10))
+
+                cancel = next(
+                    button
+                    for button in self._descendants_of_type(dialog, ttk.Button)
+                    if button.cget("text") == app_module.BUTTON_CANCEL
+                )
+                cancel.invoke()
+                self._pump()
+
+    def test_parent_period_change_clamps_all_child_periods(self) -> None:
+        self.app._on_edit(self.parent["id"])
+        self._pump()
+        dialog = next(
+            widget
+            for widget in self.root.winfo_children()
+            if isinstance(widget, tk.Toplevel)
+        )
+        start_input, end_input = self._descendants_of_type(
+            dialog,
+            app_module.DateInput,
+        )[:2]
+        start_input.set_date(app_module.date(2026, 7, 10))
+        end_input.set_date(app_module.date(2026, 7, 20))
+
+        save_button = next(
+            button
+            for button in self._descendants_of_type(dialog, ttk.Button)
+            if button.cget("style") == "Primary.TButton"
+        )
+        save_button.invoke()
+        self._pump()
+
+        self.assertEqual(
+            (self.child_a["start"], self.child_a["end"]),
+            (app_module.date(2026, 7, 10), app_module.date(2026, 7, 12)),
+        )
+        self.assertEqual(
+            (self.child_b["start"], self.child_b["end"]),
+            (app_module.date(2026, 7, 13), app_module.date(2026, 7, 20)),
+        )
+        self.assertFalse(dialog.winfo_exists())
+
+    def test_child_creation_rejects_dates_outside_parent_period(self) -> None:
+        self.app._open_entry_dialog(kind="child", parent_id=self.parent["id"])
+        self._pump()
+        dialog = next(
+            widget
+            for widget in self.root.winfo_children()
+            if isinstance(widget, tk.Toplevel)
+        )
+        all_entries = self._descendants_of_type(dialog, ttk.Entry)
+        all_entries[0].delete(0, "end")
+        all_entries[0].insert(0, "親期間外の子")
+        start_input, end_input = self._descendants_of_type(
+            dialog,
+            app_module.DateInput,
+        )[:2]
+        start_input.set_date(app_module.date(2026, 6, 30))
+        end_input.set_date(app_module.date(2026, 7, 1))
+        save_button = next(
+            button
+            for button in self._descendants_of_type(dialog, ttk.Button)
+            if button.cget("style") == "Primary.TButton"
+        )
+        child_count = len(self.parent["children"])
+        self.app._save.reset_mock()
+
+        with patch.object(app_module.messagebox, "showerror") as showerror:
+            save_button.invoke()
+            self._pump()
+
+        showerror.assert_called_once_with(
+            app_module.ERROR_INPUT_TITLE,
+            app_module.ERROR_CHILD_OUTSIDE_PARENT,
+        )
+        self.assertEqual(len(self.parent["children"]), child_count)
+        self.app._save.assert_not_called()
+        self.assertTrue(dialog.winfo_exists())
+
+    def test_child_edit_rejects_dates_outside_parent_period(self) -> None:
+        original_dates = (self.child_a["start"], self.child_a["end"])
+        self.app._on_edit(self.child_a["id"])
+        self._pump()
+        dialog = next(
+            widget
+            for widget in self.root.winfo_children()
+            if isinstance(widget, tk.Toplevel)
+        )
+        start_input, end_input = self._descendants_of_type(
+            dialog,
+            app_module.DateInput,
+        )[:2]
+        start_input.set_date(app_module.date(2026, 7, 25))
+        end_input.set_date(app_module.date(2026, 8, 1))
+        save_button = next(
+            button
+            for button in self._descendants_of_type(dialog, ttk.Button)
+            if button.cget("style") == "Primary.TButton"
+        )
+        self.app._save.reset_mock()
+
+        with patch.object(app_module.messagebox, "showerror") as showerror:
+            save_button.invoke()
+            self._pump()
+
+        showerror.assert_called_once_with(
+            app_module.ERROR_INPUT_TITLE,
+            app_module.ERROR_CHILD_OUTSIDE_PARENT,
+        )
+        self.assertEqual((self.child_a["start"], self.child_a["end"]), original_dates)
+        self.app._save.assert_not_called()
+        self.assertTrue(dialog.winfo_exists())
 
     def test_repeated_dialog_close_does_not_leak_trace_commands(self) -> None:
         before = set(self.root.tk.splitlist(self.root.tk.call("info", "commands")))

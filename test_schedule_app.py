@@ -309,7 +309,7 @@ class ScheduleAppLogicTests(unittest.TestCase):
             self.assertFalse(saved["parents"][0]["visible"])
             showerror.assert_not_called()
 
-    def test_progress_100_active_entry_still_displays_delay_after_end(self) -> None:
+    def test_progress_100_entry_does_not_display_delay_after_end(self) -> None:
         parent = new_entry(
             KIND_PARENT,
             "Finished progress but not completed",
@@ -320,20 +320,63 @@ class ScheduleAppLogicTests(unittest.TestCase):
         )
         app = self.make_app([parent])
         delay_label = Mock()
-        app.row_widgets = [SimpleNamespace(entry_id=parent["id"], delay_label=delay_label)]
+        app.row_widgets = [
+            SimpleNamespace(
+                entry_id=parent["id"],
+                delay_label=delay_label,
+                base_bg=app_module.COLOR_SURFACE,
+            )
+        ]
 
         self.assertEqual(progress_ratio(parent), 1.0)
-        self.assertEqual(app._delay_days(parent), 1)
+        self.assertEqual(app._delay_days(parent), 0)
 
         app._refresh_delay_labels()
 
         delay_label.configure.assert_called_once_with(
-            text="1日遅延",
-            fg=app_module.COLOR_DANGER,
-            bg=app_module.COLOR_DANGER_SOFT,
-            padx=4,
-            pady=2,
+            text="—",
+            fg=app_module.COLOR_TEXT_MUTED,
+            bg=app_module.COLOR_SURFACE,
+            padx=0,
+            pady=0,
         )
+
+    def test_short_canvas_is_reset_to_top_when_content_fits(self) -> None:
+        app = self.make_app()
+        canvas = Mock()
+        canvas.bbox.return_value = (0, 0, 800, 120)
+        canvas.winfo_height.return_value = 400
+
+        app._update_canvas_scrollregion(canvas)
+
+        canvas.configure.assert_called_once_with(scrollregion=(0, 0, 800, 120))
+        canvas.yview_moveto.assert_called_once_with(0.0)
+
+    def test_today_line_uses_the_row_canvas_local_date_coordinate(self) -> None:
+        entry = new_entry(
+            KIND_PARENT,
+            "Three days",
+            "2026-07-14",
+            "2026-07-16",
+            entry_id="parent-1",
+        )
+        app = self.make_app([entry])
+        app.current_jst_date = app_module.date(2026, 7, 15)
+        canvas = Mock()
+        canvas.winfo_width.return_value = 308
+        canvas.winfo_height.return_value = 40
+        app.row_widgets = [SimpleNamespace(entry_id=entry["id"], gantt_canvas=canvas)]
+
+        app._redraw_gantt_for(entry["id"])
+
+        today_line = next(
+            item
+            for item in canvas.create_line.call_args_list
+            if item.kwargs.get("fill") == app_module.TODAY_LINE_COLOR
+        )
+        self.assertAlmostEqual(today_line.args[0], 104.0)
+        self.assertAlmostEqual(today_line.args[2], 104.0)
+        canvas.winfo_rootx.assert_not_called()
 
     def test_delete_rolls_back_when_schedule_save_fails(self) -> None:
         parent, _child_a, _child_b = self.make_hierarchy()
@@ -590,7 +633,6 @@ class ScheduleAppLogicTests(unittest.TestCase):
         app.scale_canvas.winfo_height.return_value = 54
         app.scale_canvas.create_text.return_value = 1
         app.scale_canvas.bbox.return_value = None
-        app.today_label_screen_x = None
         app.current_jst_date = app_module.date(2026, 7, 15)
         app._visible_range = Mock(
             return_value=(app_module.date(9999, 12, 31), app_module.date(9999, 12, 31))
@@ -625,7 +667,6 @@ class ScheduleAppLogicTests(unittest.TestCase):
         app.scale_canvas.winfo_height.return_value = 58
         app.scale_canvas.create_text.return_value = 1
         app.scale_canvas.bbox.return_value = None
-        app.today_label_screen_x = None
         app.current_jst_date = app_module.date(2026, 7, 15)
         app._visible_range = Mock(return_value=(app_module.date.min, app_module.date.max))
         app._redraw_all_gantt = Mock()
