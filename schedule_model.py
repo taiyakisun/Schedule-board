@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 import copy
 import math
 from typing import Callable, Iterator
@@ -9,7 +9,7 @@ import unicodedata
 from uuid import UUID, uuid4, uuid5
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 KIND_PARENT = "parent"
 KIND_CHILD = "child"
 PROGRESS_PERCENT = "percent"
@@ -41,6 +41,7 @@ TODO_SORT_KEYS = frozenset(
 )
 
 _ID_NAMESPACE = UUID("f14e52f8-e596-40f6-93e4-55f56962cf10")
+TODO_TIMEZONE = timezone(timedelta(hours=9))
 
 
 @dataclass(frozen=True)
@@ -69,6 +70,27 @@ def _parse_optional_date(value: date | datetime | str | None) -> date | None:
     if value is None or (isinstance(value, str) and not value.strip()):
         return None
     return _parse_date(value)
+
+
+def parse_todo_deadline(value: date | datetime | str) -> datetime:
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, date):
+        parsed = datetime.combine(value, datetime.min.time())
+    elif isinstance(value, str):
+        parsed = datetime.fromisoformat(value.strip())
+    else:
+        raise TypeError("TODO deadline must be a date, datetime, or ISO string")
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(TODO_TIMEZONE).replace(tzinfo=None)
+    return parsed.replace(second=0, microsecond=0)
+
+
+def todo_deadline_reached(todo: dict, current_datetime: datetime) -> bool:
+    current = current_datetime
+    if current.tzinfo is not None:
+        current = current.astimezone(TODO_TIMEZONE).replace(tzinfo=None)
+    return current >= parse_todo_deadline(todo["deadline"])
 
 
 def _number(value: object, field_name: str) -> int | float:
@@ -312,7 +334,7 @@ def new_todo_entry(
         "kind": kind,
         "parent_id": None if kind == KIND_PARENT else str(parent_id),
         "task": str(task),
-        "deadline": _parse_date(deadline),
+        "deadline": parse_todo_deadline(deadline),
         "notify": bool(notify),
         "last_notified_at": str(last_notified_at) if last_notified_at else None,
         "source": _normalize_todo_source(source),
@@ -380,7 +402,7 @@ def _serialize_todo(todo: dict) -> dict:
         "kind": kind,
         "parent_id": parent_id,
         "task": str(todo.get("task", "")),
-        "deadline": _parse_date(todo["deadline"]).isoformat(),
+        "deadline": parse_todo_deadline(todo["deadline"]).isoformat(timespec="minutes"),
         "notify": bool(todo.get("notify", False)),
         "last_notified_at": (
             str(todo.get("last_notified_at"))
@@ -488,12 +510,12 @@ def _deserialize_legacy(raw: dict) -> dict:
 
 
 def deserialize_schedule(raw: dict) -> dict:
-    """Normalize a version 2/3 schedule or migrate a legacy entries document."""
+    """Normalize a version 2/3/4 schedule or migrate a legacy entries document."""
 
     if not isinstance(raw, dict):
         raise ValueError("schedule data must be an object")
     version = raw.get("version")
-    if version in (2, SCHEMA_VERSION) or (version is None and "parents" in raw):
+    if version in (2, 3, SCHEMA_VERSION) or (version is None and "parents" in raw):
         return _deserialize_v2(raw)
     if "entries" in raw or not raw:
         return _deserialize_legacy(raw)
@@ -527,7 +549,7 @@ def _serialize_common(entry: dict, kind: str, parent_id: str | None) -> dict:
 
 
 def serialize_schedule(schedule: dict) -> dict:
-    """Return a JSON-compatible version 3 document without mutating the model."""
+    """Return a JSON-compatible current-version document without mutating the model."""
 
     parents_raw = schedule.get("parents", [])
     if not isinstance(parents_raw, list):
@@ -788,8 +810,8 @@ def apply_todo_sort(schedule: dict, sort_key: str) -> bool:
     if criterion == "task":
         value_for = _task_sort_value
     else:
-        def value_for(todo: dict) -> date:
-            return _parse_date(todo["deadline"])
+        def value_for(todo: dict) -> datetime:
+            return parse_todo_deadline(todo["deadline"])
     return _sort_group_tree(schedule.get("todos", []), value_for, reverse)
 
 
@@ -918,7 +940,7 @@ def todo_notification_due(
 ) -> bool:
     if not todo.get("notify", False):
         return False
-    if _parse_date(todo["deadline"]) > current_datetime.date():
+    if not todo_deadline_reached(todo, current_datetime):
         return False
     last_text = todo.get("last_notified_at")
     if not last_text:

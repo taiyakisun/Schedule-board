@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import calendar
-from datetime import date
+from datetime import date, datetime, time
 import tkinter as tk
 from tkinter import ttk
 from typing import Callable
@@ -237,3 +237,152 @@ class DateInput(tk.Frame):
 
     def focus_year(self) -> None:
         self.year_entry.focus_set()
+
+
+class TimeInput(tk.Frame):
+    """Segmented HH:MM input."""
+
+    def __init__(
+        self,
+        master: tk.Misc,
+        *,
+        value: time | None = None,
+        background: str | None = None,
+    ) -> None:
+        super().__init__(master, bg=background or master.cget("background"))
+        self.hour_var = tk.StringVar()
+        self.minute_var = tk.StringVar()
+        self.entries: list[ttk.Entry] = []
+
+        for column, variable in enumerate((self.hour_var, self.minute_var)):
+            entry = ttk.Entry(
+                self,
+                textvariable=variable,
+                width=2,
+                justify="center",
+                style="Modern.TEntry",
+            )
+            entry.grid(row=0, column=column * 2)
+            entry.bind(
+                "<FocusIn>",
+                lambda _event, item=entry: item.after_idle(
+                    item.select_range, 0, "end"
+                ),
+            )
+            entry.bind("<colon>", lambda _event, index=column: self._advance(index))
+            entry.bind("<space>", lambda _event, index=column: self._advance(index))
+            entry.bind("<<Paste>>", self._paste)
+            entry.configure(
+                validate="key",
+                validatecommand=(
+                    self.register(
+                        lambda proposed: proposed.isdigit() and len(proposed) <= 2
+                        or proposed == ""
+                    ),
+                    "%P",
+                ),
+            )
+            self.entries.append(entry)
+            if column == 0:
+                tk.Label(
+                    self,
+                    text=":",
+                    bg=self.cget("background"),
+                    padx=3,
+                ).grid(row=0, column=1)
+
+        self.set_time(value or time(0, 0))
+
+    @property
+    def hour_entry(self) -> ttk.Entry:
+        return self.entries[0]
+
+    @property
+    def minute_entry(self) -> ttk.Entry:
+        return self.entries[1]
+
+    def _advance(self, index: int) -> str:
+        if index == 0:
+            self.minute_entry.focus_set()
+        else:
+            self.minute_entry.selection_clear()
+        return "break"
+
+    def _paste(self, _event: tk.Event) -> str | None:
+        try:
+            value = time.fromisoformat(self.clipboard_get().strip())
+        except (tk.TclError, ValueError):
+            return None
+        self.set_time(value)
+        return "break"
+
+    def set_time(self, value: time) -> None:
+        self.hour_var.set(f"{value.hour:02d}")
+        self.minute_var.set(f"{value.minute:02d}")
+
+    def get_time(self) -> time:
+        hour_text = self.hour_var.get().strip()
+        minute_text = self.minute_var.get().strip()
+        if not hour_text or not minute_text:
+            raise ValueError("時刻をすべて入力してください。")
+        return time(int(hour_text), int(minute_text))
+
+    def set_enabled(self, enabled: bool) -> None:
+        state = "normal" if enabled else "disabled"
+        for entry in self.entries:
+            entry.configure(state=state)
+
+
+class DateTimeInput(tk.Frame):
+    """DateInput combined with an HH:MM input."""
+
+    def __init__(
+        self,
+        master: tk.Misc,
+        *,
+        value: date | datetime | None = None,
+        background: str | None = None,
+    ) -> None:
+        super().__init__(master, bg=background or master.cget("background"))
+        initial_date = value.date() if isinstance(value, datetime) else value
+        initial_time = value.time() if isinstance(value, datetime) else time(0, 0)
+        self.date_input = DateInput(
+            self,
+            value=initial_date,
+            background=self.cget("background"),
+        )
+        self.date_input.grid(row=0, column=0, sticky="ew")
+        self.columnconfigure(0, weight=1)
+        tk.Label(
+            self,
+            text="時刻",
+            bg=self.cget("background"),
+            padx=8,
+        ).grid(row=0, column=1)
+        self.time_input = TimeInput(
+            self,
+            value=initial_time,
+            background=self.cget("background"),
+        )
+        self.time_input.grid(row=0, column=2)
+
+    def set_datetime(self, value: date | datetime) -> None:
+        if isinstance(value, datetime):
+            self.date_input.set_date(value.date())
+            self.time_input.set_time(value.time())
+        else:
+            self.date_input.set_date(value)
+            self.time_input.set_time(time(0, 0))
+
+    def get_datetime(self) -> datetime:
+        selected_date = self.date_input.get_date()
+        if selected_date is None:
+            raise ValueError("日付を入力してください。")
+        return datetime.combine(selected_date, self.time_input.get_time())
+
+    def set_enabled(self, enabled: bool) -> None:
+        self.date_input.set_enabled(enabled)
+        self.time_input.set_enabled(enabled)
+
+    def focus_year(self) -> None:
+        self.date_input.focus_year()

@@ -85,6 +85,7 @@ class ScheduleAppTkTests(unittest.TestCase):
                 app_module.TEXT_DELETE,
                 app_module.TEXT_UP,
                 app_module.TEXT_DOWN,
+                app_module.TEXT_COMPLETE,
                 app_module.TEXT_SORT,
                 app_module.TEXT_MORE,
             },
@@ -107,6 +108,7 @@ class ScheduleAppTkTests(unittest.TestCase):
                 app_module.TEXT_DELETE,
                 app_module.TEXT_UP,
                 app_module.TEXT_DOWN,
+                app_module.TEXT_COMPLETE,
                 app_module.TEXT_SORT,
                 app_module.TEXT_SETTINGS,
             },
@@ -117,6 +119,10 @@ class ScheduleAppTkTests(unittest.TestCase):
         self.assertTrue(
             isinstance(self.app.toolbar_buttons[app_module.TEXT_DOWN], ttk.Button)
         )
+        complete_button = self.app.toolbar_buttons[app_module.TEXT_COMPLETE]
+        self.assertIsInstance(complete_button, ttk.Button)
+        self.assertEqual(complete_button.cget("text"), "✓ 完了")
+        self.assertEqual(complete_button.cget("style"), "Success.TButton")
         self.assertEqual(
             self.app.schedule_sort_button.menu.entrycget(0, "label"),
             "ソートなし",
@@ -129,6 +135,10 @@ class ScheduleAppTkTests(unittest.TestCase):
             self.app.todo_sort_button.menu.entrycget(4, "label"),
             "期限：降順",
         )
+        todo_complete = self.app.todo_toolbar_buttons[app_module.TEXT_COMPLETE]
+        self.assertIsInstance(todo_complete, ttk.Button)
+        self.assertEqual(todo_complete.cget("text"), "✓ 完了")
+        self.assertEqual(todo_complete.cget("style"), "Success.TButton")
 
         task_font = self.app.task_font.actual()
         parent_font = self.app.parent_font.actual()
@@ -150,6 +160,7 @@ class ScheduleAppTkTests(unittest.TestCase):
         self.assertEqual(rows[1].started_label.cget("text"), "07/16")
         self.assertEqual(rows[2].started_label.cget("text"), "07/13")
         for row in rows:
+            self.assertFalse(hasattr(row, "complete_button"))
             self.assertEqual(row.drag_handle.cget("text"), app_module.DRAG_HANDLE_TEXT)
             self.assertEqual(row.drag_handle.cget("cursor"), "fleur")
             self.assertTrue(row.drag_handle.bind("<B1-Motion>"))
@@ -911,7 +922,7 @@ class ScheduleAppTkTests(unittest.TestCase):
         )
 
     def _row_splitter_x(self, widgets: app_module.RowWidgets) -> int:
-        column_box = widgets.container.grid_bbox(6, 0, 6, 0)
+        column_box = widgets.container.grid_bbox(5, 0, 5, 0)
         return widgets.container.winfo_rootx() + column_box[0]
 
     def test_scroll_range_and_modern_dialog(self) -> None:
@@ -1180,6 +1191,44 @@ class ScheduleAppTkTests(unittest.TestCase):
         cancel.invoke()
         self._pump()
 
+    def test_todo_dialog_edits_deadline_hour_and_minute(self) -> None:
+        todo = new_todo_entry(
+            KIND_PARENT,
+            "時刻付きTODO",
+            "2026-07-22T09:00",
+            entry_id="todo-with-time",
+        )
+        self.app.schedule["todos"] = [todo]
+        self.app._ensure_schedule_defaults()
+        self.app._on_edit_todo(todo["id"])
+        self._pump()
+
+        dialog = next(
+            widget
+            for widget in self.root.winfo_children()
+            if isinstance(widget, tk.Toplevel)
+        )
+        deadline_input = self._descendants_of_type(
+            dialog, app_module.DateTimeInput
+        )[0]
+        self.assertEqual(
+            deadline_input.get_datetime(),
+            app_module.datetime(2026, 7, 22, 9, 0),
+        )
+        deadline_input.time_input.hour_var.set("24")
+        with self.assertRaises(ValueError):
+            deadline_input.get_datetime()
+        deadline_input.set_datetime(app_module.datetime(2026, 7, 22, 10, 45))
+        ok_button = next(
+            button
+            for button in self._descendants_of_type(dialog, ttk.Button)
+            if button.cget("text") == app_module.BUTTON_OK
+        )
+        ok_button.invoke()
+        self._pump()
+
+        self.assertEqual(todo["deadline"], app_module.datetime(2026, 7, 22, 10, 45))
+
     def test_todo_tab_displays_hierarchy_and_notification_state(self) -> None:
         parent = new_todo_entry(
             KIND_PARENT,
@@ -1211,6 +1260,10 @@ class ScheduleAppTkTests(unittest.TestCase):
         self.assertEqual(
             [row.notify_button.cget("text") for row in self.app.todo_row_widgets],
             ["ON", "OFF"],
+        )
+        self.assertEqual(
+            [row.deadline_label.cget("text") for row in self.app.todo_row_widgets],
+            ["2026-07-20 00:00", "2026-07-21 00:00"],
         )
         self.assertTrue(self.app.todo_header.winfo_ismapped())
         self.assertFalse(self.app.header.winfo_ismapped())

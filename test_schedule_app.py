@@ -8,7 +8,14 @@ from unittest.mock import Mock, call, patch
 import zipfile
 
 import sch_gantt_main as app_module
-from schedule_model import KIND_CHILD, KIND_PARENT, new_entry, progress_ratio, progress_text
+from schedule_model import (
+    KIND_CHILD,
+    KIND_PARENT,
+    new_entry,
+    new_todo_entry,
+    progress_ratio,
+    progress_text,
+)
 
 
 class ApplicationResourceTests(unittest.TestCase):
@@ -181,7 +188,7 @@ class ScheduleAppLogicTests(unittest.TestCase):
 
             self.assertEqual(app.entries, [])
             self.assertIsNone(app.selected_id)
-            self.assertEqual(json.loads(data_file.read_text(encoding="utf-8")), {"version": 3, "parents": []})
+            self.assertEqual(json.loads(data_file.read_text(encoding="utf-8")), {"version": 4, "parents": []})
             app._rebuild_rows.assert_called_once_with()
             showerror.assert_not_called()
 
@@ -231,9 +238,151 @@ class ScheduleAppLogicTests(unittest.TestCase):
             )
             self.assertTrue(all(record[app_module.LOG_FIELD_COMPLETED] is True for record in records))
             self.assertEqual(app.entries, [])
-            self.assertEqual(json.loads(data_file.read_text(encoding="utf-8")), {"version": 3, "parents": []})
+            self.assertEqual(json.loads(data_file.read_text(encoding="utf-8")), {"version": 4, "parents": []})
             app._rebuild_rows.assert_called_once_with()
             showerror.assert_not_called()
+
+    def test_complete_toolbar_action_uses_selected_schedule(self) -> None:
+        app = self.make_app()
+        app._on_complete = Mock()
+
+        app._on_complete_selected()
+        app._on_complete.assert_not_called()
+
+        app.selected_id = "selected-task"
+        app._on_complete_selected()
+        app._on_complete.assert_called_once_with("selected-task")
+
+    def test_complete_todo_toolbar_action_uses_selected_todo(self) -> None:
+        app = self.make_app()
+        app.selected_todo_id = None
+        app._on_complete_todo = Mock()
+
+        app._on_complete_selected_todo()
+        app._on_complete_todo.assert_not_called()
+
+        app.selected_todo_id = "selected-todo"
+        app._on_complete_selected_todo()
+        app._on_complete_todo.assert_called_once_with("selected-todo")
+
+    def test_completing_parent_todo_logs_parent_and_children_before_removal(self) -> None:
+        parent = new_todo_entry(
+            KIND_PARENT,
+            "Parent TODO",
+            "2026-07-22T09:00",
+            entry_id="todo-parent",
+        )
+        child = new_todo_entry(
+            KIND_CHILD,
+            "Child TODO",
+            "2026-07-22T10:30",
+            parent_id=parent["id"],
+            entry_id="todo-child",
+        )
+        parent["children"] = [child]
+        app = self.make_app()
+        app.schedule["todos"] = [parent]
+        app.todos = app.schedule["todos"]
+        app.selected_todo_id = parent["id"]
+        app._rebuild_todo_rows = Mock()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_file = Path(temp_dir) / "schedules.json"
+            log_file = Path(temp_dir) / "completed_tasks.jsonl"
+            with (
+                patch.object(app_module, "DATA_FILE", str(data_file)),
+                patch.object(app_module, "COMPLETE_LOG_FILE", str(log_file)),
+                patch.object(app_module.messagebox, "askyesno", return_value=True),
+                patch.object(app_module.messagebox, "showerror") as showerror,
+            ):
+                app._on_complete_todo(parent["id"])
+
+            records = [
+                json.loads(line)
+                for line in log_file.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(
+                [record[app_module.LOG_FIELD_ID] for record in records],
+                [parent["id"], child["id"]],
+            )
+            self.assertTrue(
+                all(
+                    record[app_module.LOG_FIELD_ORIGIN] == app_module.LOG_ORIGIN_TODO
+                    for record in records
+                )
+            )
+            self.assertEqual(
+                [record[app_module.LOG_FIELD_DEADLINE] for record in records],
+                ["2026-07-22T09:00", "2026-07-22T10:30"],
+            )
+            self.assertEqual(app.todos, [])
+            self.assertIsNone(app.selected_todo_id)
+            self.assertEqual(
+                json.loads(data_file.read_text(encoding="utf-8"))["todos"],
+                [],
+            )
+            app._rebuild_todo_rows.assert_called_once_with()
+            showerror.assert_not_called()
+
+    def test_completing_child_todo_removes_only_child_and_selects_parent(self) -> None:
+        parent = new_todo_entry(
+            KIND_PARENT,
+            "Parent TODO",
+            "2026-07-22T09:00",
+            entry_id="todo-parent",
+        )
+        child = new_todo_entry(
+            KIND_CHILD,
+            "Child TODO",
+            "2026-07-22T10:30",
+            parent_id=parent["id"],
+            entry_id="todo-child",
+        )
+        parent["children"] = [child]
+        app = self.make_app()
+        app.schedule["todos"] = [parent]
+        app.todos = app.schedule["todos"]
+        app.selected_todo_id = child["id"]
+        app._rebuild_todo_rows = Mock()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                patch.object(app_module, "DATA_FILE", str(Path(temp_dir) / "schedules.json")),
+                patch.object(
+                    app_module,
+                    "COMPLETE_LOG_FILE",
+                    str(Path(temp_dir) / "completed_tasks.jsonl"),
+                ),
+                patch.object(app_module.messagebox, "askyesno", return_value=True),
+            ):
+                app._on_complete_todo(child["id"])
+
+        self.assertEqual(parent["children"], [])
+        self.assertEqual(app.selected_todo_id, parent["id"])
+
+    def test_todo_completion_rolls_back_when_journal_write_fails(self) -> None:
+        todo = new_todo_entry(
+            KIND_PARENT,
+            "Rollback TODO",
+            "2026-07-22T09:00",
+            entry_id="todo-rollback",
+        )
+        app = self.make_app()
+        app.schedule["todos"] = [todo]
+        app.todos = app.schedule["todos"]
+        app.selected_todo_id = todo["id"]
+        app._rebuild_todo_rows = Mock()
+
+        with (
+            patch.object(app_module.messagebox, "askyesno", return_value=True),
+            patch.object(app_module.messagebox, "showerror") as showerror,
+            patch.object(app_module, "atomic_write_text", side_effect=OSError("write failed")),
+        ):
+            app._on_complete_todo(todo["id"])
+
+        self.assertEqual([item["id"] for item in app.todos], [todo["id"]])
+        self.assertEqual(app.selected_todo_id, todo["id"])
+        showerror.assert_called_once()
 
     def test_completing_child_logs_and_removes_only_that_child(self) -> None:
         parent, child_a, child_b = self.make_hierarchy()
@@ -276,7 +425,7 @@ class ScheduleAppLogicTests(unittest.TestCase):
         app._save.assert_called_once_with()
         app._rebuild_rows.assert_called_once_with()
 
-    def test_loads_legacy_v1_and_saves_version_3(self) -> None:
+    def test_loads_legacy_v1_and_saves_current_version(self) -> None:
         legacy = {
             "entries": [
                 {
@@ -300,7 +449,7 @@ class ScheduleAppLogicTests(unittest.TestCase):
                 app._save()
 
             saved = json.loads(data_file.read_text(encoding="utf-8"))
-            self.assertEqual(saved["version"], 3)
+            self.assertEqual(saved["version"], 4)
             self.assertNotIn("entries", saved)
             self.assertEqual(len(saved["parents"]), 1)
             self.assertEqual(saved["parents"][0]["task"], "Legacy task")
@@ -547,6 +696,31 @@ class ScheduleAppLogicTests(unittest.TestCase):
         self.assertFalse(app.load_failed)
         showerror.assert_not_called()
 
+    def test_todo_completion_log_is_not_restored_as_schedule_state(self) -> None:
+        app = self.make_app()
+        todo = new_todo_entry(
+            KIND_PARENT,
+            "TODO item",
+            "2026-07-22T09:00",
+            entry_id="todo-1",
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_file = Path(temp_dir) / "completed_tasks.jsonl"
+            log_file.write_text(
+                json.dumps(app._todo_completion_record(todo), ensure_ascii=False) + "\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            with (
+                patch.object(app_module, "COMPLETE_LOG_FILE", str(log_file)),
+                patch.object(app_module.messagebox, "showerror") as showerror,
+            ):
+                latest = app._load_latest_completion_states()
+
+        self.assertEqual(latest, {})
+        showerror.assert_not_called()
+
     def test_atomic_log_update_salvages_only_a_torn_final_line(self) -> None:
         parent, child_a, _child_b = self.make_hierarchy()
         app = self.make_app([parent])
@@ -683,7 +857,6 @@ class ScheduleAppLogicTests(unittest.TestCase):
         app.task_column_width = 280
         app.progress_column_width = 150
         app.delay_column_width = 76
-        app.complete_column_width = 66
         app.row_content_height = 30
         task_frame = Mock()
         row = Mock()

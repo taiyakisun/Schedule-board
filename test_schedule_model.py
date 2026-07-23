@@ -33,6 +33,7 @@ from schedule_model import (
     restore_group_order,
     serialize_schedule,
     started_date_for_progress,
+    parse_todo_deadline,
     todo_notification_due,
     visible_rows,
 )
@@ -144,7 +145,7 @@ class ScheduleModelTests(unittest.TestCase):
         first = deserialize_schedule(legacy)
         second = deserialize_schedule(legacy)
 
-        self.assertEqual(first["version"], 3)
+        self.assertEqual(first["version"], 4)
         self.assertEqual([entry["id"] for entry in first["parents"]], [entry["id"] for entry in second["parents"]])
         self.assertEqual([entry["kind"] for entry in first["parents"]], [KIND_PARENT, KIND_PARENT])
         self.assertEqual([entry["parent_id"] for entry in first["parents"]], [None, None])
@@ -571,23 +572,72 @@ class ScheduleModelTests(unittest.TestCase):
         restored = deserialize_schedule(serialized)
         self.assertTrue(restored["todos"][0]["notify"])
 
+    def test_todo_deadline_round_trip_preserves_minutes_and_migrates_dates(self) -> None:
+        migrated = deserialize_schedule(
+            {
+                "version": 3,
+                "parents": [],
+                "todos": [
+                    {
+                        "id": "legacy-todo",
+                        "kind": "parent",
+                        "task": "Legacy saved TODO",
+                        "deadline": "2026-07-22",
+                        "children": [],
+                    }
+                ],
+            }
+        )
+        self.assertEqual(
+            migrated["todos"][0]["deadline"],
+            datetime(2026, 7, 22, 0, 0),
+        )
+        legacy = new_todo_entry(KIND_PARENT, "Legacy", "2026-07-22")
+        timed = new_todo_entry(KIND_PARENT, "Timed", "2026-07-22T09:00")
+
+        self.assertEqual(legacy["deadline"], datetime(2026, 7, 22, 0, 0))
+        self.assertEqual(timed["deadline"], datetime(2026, 7, 22, 9, 0))
+
+        serialized = serialize_schedule(
+            {"version": 3, "parents": [], "todos": [legacy, timed]}
+        )
+        self.assertEqual(serialized["version"], 4)
+        self.assertEqual(
+            [todo["deadline"] for todo in serialized["todos"]],
+            ["2026-07-22T00:00", "2026-07-22T09:00"],
+        )
+        restored = deserialize_schedule(serialized)
+        self.assertEqual(
+            [todo["deadline"] for todo in restored["todos"]],
+            [datetime(2026, 7, 22, 0, 0), datetime(2026, 7, 22, 9, 0)],
+        )
+        self.assertEqual(
+            parse_todo_deadline(date(2026, 7, 22)),
+            datetime(2026, 7, 22, 0, 0),
+        )
+
     def test_rejects_unknown_future_schedule_version(self) -> None:
         with self.assertRaises(ValueError):
             deserialize_schedule({"version": 99, "parents": []})
 
     def test_todo_notification_due_respects_deadline_switch_and_hour_interval(self) -> None:
-        now = datetime(2026, 7, 20, 10, 0, tzinfo=timezone(timedelta(hours=9)))
-        todo = new_todo_entry(KIND_PARENT, "Due", "2026-07-20", notify=True)
-        self.assertTrue(todo_notification_due(todo, now))
-        todo["last_notified_at"] = "2026-07-20T09:01:00+09:00"
-        self.assertFalse(todo_notification_due(todo, now))
-        todo["last_notified_at"] = "2026-07-20T09:00:00+09:00"
-        self.assertTrue(todo_notification_due(todo, now))
+        jst = timezone(timedelta(hours=9))
+        todo = new_todo_entry(
+            KIND_PARENT,
+            "Due",
+            "2026-07-22T09:00",
+            notify=True,
+        )
+        self.assertFalse(todo_notification_due(todo, datetime(2026, 7, 22, 8, 59, 59, tzinfo=jst)))
+        self.assertTrue(todo_notification_due(todo, datetime(2026, 7, 22, 9, 0, 35, tzinfo=jst)))
+        todo["last_notified_at"] = "2026-07-22T09:00:35+09:00"
+        self.assertFalse(todo_notification_due(todo, datetime(2026, 7, 22, 10, 0, 34, tzinfo=jst)))
+        self.assertTrue(todo_notification_due(todo, datetime(2026, 7, 22, 10, 0, 35, tzinfo=jst)))
         todo["notify"] = False
-        self.assertFalse(todo_notification_due(todo, now))
+        self.assertFalse(todo_notification_due(todo, datetime(2026, 7, 22, 11, 0, tzinfo=jst)))
         todo["notify"] = True
-        todo["deadline"] = date(2026, 7, 21)
-        self.assertFalse(todo_notification_due(todo, now))
+        todo["deadline"] = datetime(2026, 7, 23, 9, 0)
+        self.assertFalse(todo_notification_due(todo, datetime(2026, 7, 22, 11, 0, tzinfo=jst)))
 
     def test_delay_boundaries_use_the_supplied_calendar_date(self) -> None:
         entry = self.make_parent("parent-1")
@@ -736,7 +786,7 @@ class ScheduleModelTests(unittest.TestCase):
             new_todo_entry(
                 KIND_PARENT,
                 "Beta",
-                "2026-07-20",
+                "2026-07-20T12:00",
                 entry_id="first",
             ),
             new_todo_entry(
@@ -748,7 +798,7 @@ class ScheduleModelTests(unittest.TestCase):
             new_todo_entry(
                 KIND_PARENT,
                 "Gamma",
-                "2026-07-15",
+                "2026-07-20T09:00",
                 entry_id="third",
             ),
         ]

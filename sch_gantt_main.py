@@ -10,8 +10,9 @@ import tkinter as tk
 from tkinter import filedialog, font as tkfont, messagebox, ttk
 
 from excel_export import export_to_excel
-from date_widgets import DateInput
+from date_widgets import DateInput, DateTimeInput
 from schedule_model import (
+    SCHEMA_VERSION,
     SCHEDULE_SORT_KEYS,
     SORT_NONE,
     TODO_SORT_KEYS,
@@ -37,12 +38,14 @@ from schedule_model import (
     new_todo_entry,
     progress_ratio,
     progress_text,
+    parse_todo_deadline,
     remove_entry,
     remove_todo,
     restore_group_order,
     serialize_schedule,
     started_date_for_progress,
     todo_notification_due,
+    todo_deadline_reached,
 )
 
 
@@ -68,7 +71,6 @@ LABEL_TASK = "タスク"
 LABEL_PROGRESS = "進捗度"
 LABEL_STARTED = "着手日"
 LABEL_DELAY = "遅延日数"
-LABEL_COMPLETE = "完了"
 LABEL_DEADLINE = "期限"
 LABEL_NOTIFICATION = "通知"
 TEXT_ADD_PARENT = "親を追加"
@@ -94,7 +96,6 @@ TEXT_PARENT = "親"
 TEXT_CHILD = "子"
 TEXT_PERCENT_MODE = "0～100%"
 TEXT_VALUE_MODE = "指定数値"
-COMPLETE_BUTTON_WIDTH = 8
 ROW_CONTENT_MIN_HEIGHT = 30
 ROW_CONTENT_DEFAULT_HEIGHT = 40
 DRAG_HANDLE_TEXT = "↕"
@@ -168,6 +169,7 @@ ERROR_INPUT_TITLE = "入力エラー"
 ERROR_CHILD_OUTSIDE_PARENT = "子スケジュールの開始日と終了日は、親スケジュールの期間内で指定してください。"
 ERROR_EMPTY_TASK = "タスク名を入力してください。"
 ERROR_INVALID_DATE = "日付はYYYY-MM-DD形式で入力してください。"
+ERROR_INVALID_DEADLINE = "期限は有効な日付と時刻（時・分）で入力してください。"
 ERROR_INVALID_PROGRESS = "進捗は0以上の数値で入力してください。"
 ERROR_PERCENT_RANGE = "パーセントの進捗は0～100で入力してください。"
 ERROR_VALUE_RANGE = "指定数値の分母は0より大きく、進捗は分母以下で入力してください。"
@@ -192,6 +194,8 @@ CONFIRM_DELETE_PARENT_MESSAGE = "「{task}」と配下の子タスク{count}件�
 CONFIRM_COMPLETE_TITLE = "完了確認"
 CONFIRM_COMPLETE_MESSAGE = "「{task}」を完了にしますか？"
 CONFIRM_COMPLETE_PARENT_MESSAGE = "「{task}」と配下の子タスク{count}件をすべて完了にしますか？"
+CONFIRM_COMPLETE_TODO_MESSAGE = "「{task}」を完了にしますか？"
+CONFIRM_COMPLETE_TODO_PARENT_MESSAGE = "「{task}」と配下の子TODO{count}件をすべて完了にしますか？"
 
 LOG_FIELD_TASK = "タスク名"
 LOG_FIELD_START = "開始日"
@@ -206,6 +210,9 @@ LOG_FIELD_PROGRESS_MODE = "進捗モード"
 LOG_FIELD_PROGRESS_VALUE = "進捗値"
 LOG_FIELD_PROGRESS_TOTAL = "進捗分母"
 LOG_FIELD_STARTED = "着手日"
+LOG_FIELD_ORIGIN = "記録元"
+LOG_FIELD_DEADLINE = "期限"
+LOG_ORIGIN_TODO = "TODO"
 
 JST = timezone(timedelta(hours=9))
 JST_MONITOR_MS = 30_000
@@ -472,7 +479,6 @@ class RowWidgets:
     progress_canvas: tk.Canvas
     started_label: tk.Label
     delay_label: tk.Label
-    complete_button: ttk.Button
     gantt_canvas: tk.Canvas
     base_bg: str
 
@@ -513,7 +519,7 @@ class ScheduleApp:
         self.root.geometry(f"{initial_width}x{initial_height}")
 
         self.schedule: dict = {
-            "version": 3,
+            "version": SCHEMA_VERSION,
             "parents": [],
             "todos": [],
             "settings": {"row_height": ROW_CONTENT_DEFAULT_HEIGHT},
@@ -548,7 +554,6 @@ class ScheduleApp:
         self.task_column_width = 320
         self.progress_column_width = PROGRESS_COLUMN_MIN_WIDTH
         self.delay_column_width = 76
-        self.complete_column_width = self._measure_complete_button_width()
         self.splitter_width = 6
         self._drag_start_x: int | None = None
         self._drag_start_width: int | None = None
@@ -843,6 +848,7 @@ class ScheduleApp:
                 for todo in due_todos:
                     todo["last_notified_at"] = now.isoformat(timespec="seconds")
                 self._save_or_restore(snapshot)
+        self._refresh_todo_deadline_labels(now)
         self._schedule_after(TODO_MONITOR_MS, self._check_todo_notifications)
 
     # ----- persistence -----
@@ -933,6 +939,35 @@ class ScheduleApp:
             LOG_FIELD_PROGRESS_VALUE: entry.get("progress_value", 0),
             LOG_FIELD_PROGRESS_TOTAL: entry.get("progress_total", 100),
             LOG_FIELD_STARTED: format_date(started) if started else None,
+        }
+
+    def _todo_completion_record(self, todo: dict) -> dict:
+        deadline = parse_todo_deadline(todo["deadline"])
+        deadline_date = deadline.date()
+        source = todo.get("source") if isinstance(todo.get("source"), dict) else {}
+        try:
+            source_start = parse_date(str(source.get("start", deadline_date.isoformat())))
+            source_end = parse_date(str(source.get("end", source_start.isoformat())))
+            duration = max(0, (source_end - source_start).days)
+        except ValueError:
+            duration = 0
+        end_ordinal = min(date.max.toordinal(), deadline_date.toordinal() + duration)
+        return {
+            LOG_FIELD_TASK: todo["task"],
+            LOG_FIELD_START: format_date(deadline_date),
+            LOG_FIELD_END: format_date(date.fromordinal(end_ordinal)),
+            LOG_FIELD_COMPLETED_AT: current_jst_timestamp(),
+            LOG_FIELD_COMPLETED: True,
+            LOG_FIELD_ID: todo["id"],
+            LOG_FIELD_KIND: TEXT_PARENT if todo["kind"] == "parent" else TEXT_CHILD,
+            LOG_FIELD_PARENT_ID: todo.get("parent_id"),
+            LOG_FIELD_VISIBLE: bool(source.get("visible", True)),
+            LOG_FIELD_PROGRESS_MODE: source.get("progress_mode", "percent"),
+            LOG_FIELD_PROGRESS_VALUE: source.get("progress_value", 0),
+            LOG_FIELD_PROGRESS_TOTAL: source.get("progress_total", 100),
+            LOG_FIELD_STARTED: source.get("started"),
+            LOG_FIELD_ORIGIN: LOG_ORIGIN_TODO,
+            LOG_FIELD_DEADLINE: deadline.isoformat(timespec="minutes"),
         }
 
     def _completion_journal_path(self) -> str:
@@ -1089,6 +1124,8 @@ class ScheduleApp:
                     raise ValueError(
                         f"{line_no}行目: 必須キーが不足しています。 {', '.join(missing)}"
                     )
+                if raw.get(LOG_FIELD_ORIGIN) == LOG_ORIGIN_TODO:
+                    continue
 
                 task = str(raw[LOG_FIELD_TASK])
                 try:
@@ -1381,6 +1418,13 @@ class ScheduleApp:
             style="Secondary.TButton",
             cursor="hand2",
         )
+        schedule_complete = ttk.Button(
+            self.schedule_toolbar,
+            text=f"✓ {TEXT_COMPLETE}",
+            command=self._on_complete_selected,
+            style="Success.TButton",
+            cursor="hand2",
+        )
         schedule_more = create_menu_button(
             self.schedule_toolbar,
             "その他",
@@ -1402,6 +1446,7 @@ class ScheduleApp:
             (TEXT_DELETE, schedule_delete),
             (TEXT_UP, schedule_up),
             (TEXT_DOWN, schedule_down),
+            (TEXT_COMPLETE, schedule_complete),
             (TEXT_SORT, self.schedule_sort_button),
             (TEXT_MORE, schedule_more),
         )
@@ -1458,6 +1503,13 @@ class ScheduleApp:
             style="Secondary.TButton",
             cursor="hand2",
         )
+        todo_complete = ttk.Button(
+            self.todo_toolbar,
+            text=f"✓ {TEXT_COMPLETE}",
+            command=self._on_complete_selected_todo,
+            style="Success.TButton",
+            cursor="hand2",
+        )
         todo_settings = ttk.Button(
             self.todo_toolbar,
             text="表示設定",
@@ -1476,6 +1528,7 @@ class ScheduleApp:
             (TEXT_DELETE, todo_delete),
             (TEXT_UP, todo_up),
             (TEXT_DOWN, todo_down),
+            (TEXT_COMPLETE, todo_complete),
             (TEXT_SORT, self.todo_sort_button),
             (TEXT_SETTINGS, todo_settings),
         )
@@ -1497,6 +1550,27 @@ class ScheduleApp:
         )
         self.todo_toolbar_buttons[TEXT_MOVE_TO_SCHEDULE] = todo_move
 
+        def adjust_toolbar_spacing(
+            event: tk.Event,
+            controls: tuple[tuple[str, tk.Widget], ...],
+        ) -> None:
+            compact = event.width < 1100
+            first_gap = 6 if compact else 14
+            control_gap = 1 if compact else 7
+            for column, (_key, control) in enumerate(controls):
+                control.grid_configure(
+                    padx=(0, first_gap if column == 0 else control_gap)
+                )
+
+        self.schedule_toolbar.bind(
+            "<Configure>",
+            lambda event: adjust_toolbar_spacing(event, schedule_controls),
+        )
+        self.todo_toolbar.bind(
+            "<Configure>",
+            lambda event: adjust_toolbar_spacing(event, todo_controls),
+        )
+
         self.schedule_row_menu = tk.Menu(self.root, tearoff=False)
         self.schedule_row_menu.add_command(
             label=TEXT_MOVE_TO_TODO,
@@ -1515,8 +1589,8 @@ class ScheduleApp:
             highlightbackground=COLOR_BORDER_SOFT,
         )
         self.header.grid(row=1, column=0, sticky="ew", padx=(16, 16))
-        for column in range(8):
-            self.header.columnconfigure(column, weight=1 if column == 7 else 0)
+        for column in range(7):
+            self.header.columnconfigure(column, weight=1 if column == 6 else 0)
 
         self.header_labels: dict[str, tk.Label] = {}
         header_specs = (
@@ -1525,7 +1599,6 @@ class ScheduleApp:
             (2, LABEL_PROGRESS, None, (0, 8)),
             (3, LABEL_STARTED, None, (0, 8)),
             (4, LABEL_DELAY, None, (0, 8)),
-            (5, LABEL_COMPLETE, None, (0, 8)),
         )
         for column, text, width, padding in header_specs:
             label = tk.Label(
@@ -1560,7 +1633,7 @@ class ScheduleApp:
             highlightthickness=0,
             background=COLOR_HEADER,
         )
-        self.scale_canvas.grid(row=0, column=7, rowspan=2, sticky="ew", padx=(0, 4))
+        self.scale_canvas.grid(row=0, column=6, rowspan=2, sticky="ew", padx=(0, 4))
         self.scale_canvas.bind("<Configure>", lambda _event: self._redraw_scale())
 
         self.splitter = tk.Frame(
@@ -1569,7 +1642,7 @@ class ScheduleApp:
             cursor="sb_h_double_arrow",
             bg=COLOR_BORDER_SOFT,
         )
-        self.splitter.grid(row=0, column=6, rowspan=2, sticky="ns")
+        self.splitter.grid(row=0, column=5, rowspan=2, sticky="ns")
         self.splitter.bind("<Button-1>", self._on_splitter_press)
         self.splitter.bind("<B1-Motion>", self._on_splitter_drag)
         self.splitter.bind("<ButtonRelease-1>", self._on_splitter_release)
@@ -1621,7 +1694,7 @@ class ScheduleApp:
         )
         self.todo_header.grid(row=1, column=0, sticky="ew", padx=16)
         self.todo_header.columnconfigure(0, weight=1)
-        self.todo_header.columnconfigure(1, minsize=120)
+        self.todo_header.columnconfigure(1, minsize=150)
         self.todo_header.columnconfigure(2, minsize=110)
         for column, text in enumerate((LABEL_TASK, LABEL_DEADLINE, LABEL_NOTIFICATION)):
             tk.Label(
@@ -2139,7 +2212,6 @@ class ScheduleApp:
         self.header.columnconfigure(2, minsize=self.progress_column_width)
         self.header.columnconfigure(3, minsize=STARTED_COLUMN_WIDTH)
         self.header.columnconfigure(4, minsize=self.delay_column_width)
-        self.header.columnconfigure(5, minsize=self.complete_column_width + 8)
         for widgets in self.row_widgets:
             row = widgets.container
             row.columnconfigure(0, minsize=VISIBILITY_COLUMN_WIDTH)
@@ -2147,20 +2219,8 @@ class ScheduleApp:
             row.columnconfigure(2, minsize=self.progress_column_width)
             row.columnconfigure(3, minsize=STARTED_COLUMN_WIDTH)
             row.columnconfigure(4, minsize=self.delay_column_width)
-            row.columnconfigure(5, minsize=self.complete_column_width)
             widgets.task_frame.configure(width=self.task_column_width, height=self.row_content_height)
             widgets.task_frame.grid_propagate(False)
-
-    def _measure_complete_button_width(self) -> int:
-        probe = ttk.Button(
-            self.root,
-            text=f"✓ {TEXT_COMPLETE}",
-            width=COMPLETE_BUTTON_WIDTH,
-            style="Success.TButton",
-        )
-        width = probe.winfo_reqwidth()
-        probe.destroy()
-        return width
 
     def _update_initial_task_width(self) -> None:
         all_entries = list(iter_all_entries(self.schedule))
@@ -2222,10 +2282,11 @@ class ScheduleApp:
             return
         if getattr(self, "active_mode", "schedule") == "todo":
             todo_count = len(list(iter_all_todos(self.schedule)))
+            now = datetime.now(JST)
             due_count = sum(
                 1
                 for todo in iter_all_todos(self.schedule)
-                if todo.get("deadline") <= self.current_jst_date
+                if todo_deadline_reached(todo, now)
             )
             self.summary_label.configure(
                 text=f"{todo_count}件のTODO  ·  期限到来 {due_count}件"
@@ -2322,7 +2383,7 @@ class ScheduleApp:
         row = tk.Frame(self.todo_rows_container, bg=base_bg, height=self.row_content_height)
         row.grid(row=row_index, column=0, sticky="ew")
         row.columnconfigure(0, weight=1)
-        row.columnconfigure(1, minsize=120)
+        row.columnconfigure(1, minsize=150)
         row.columnconfigure(2, minsize=110)
         row.grid_propagate(False)
         row.bind("<Button-1>", lambda _event, item_id=entry_id: self._select_todo(item_id))
@@ -2381,12 +2442,13 @@ class ScheduleApp:
         task_label.bind("<Double-1>", lambda _event, item_id=entry_id: self._on_edit_todo(item_id))
 
         deadline = todo.get("deadline")
+        deadline_reached = todo_deadline_reached(todo, datetime.now(JST))
         deadline_label = tk.Label(
             row,
-            text=deadline.strftime("%Y-%m-%d") if isinstance(deadline, date) else "",
+            text=deadline.strftime("%Y-%m-%d %H:%M") if isinstance(deadline, datetime) else "",
             anchor="w",
             bg=base_bg,
-            fg=COLOR_DANGER if isinstance(deadline, date) and deadline <= self.current_jst_date else COLOR_TEXT,
+            fg=COLOR_DANGER if deadline_reached else COLOR_TEXT,
             font=self.small_font,
         )
         deadline_label.grid(row=0, column=1, sticky="ew", padx=(8, 8))
@@ -2431,6 +2493,23 @@ class ScheduleApp:
         self.selected_todo_id = entry_id
         self._refresh_todo_selection()
 
+    def _refresh_todo_deadline_labels(self, now: datetime | None = None) -> None:
+        current = now or datetime.now(JST)
+        for widgets in self.todo_row_widgets:
+            location = find_todo(self.schedule, widgets.entry_id)
+            if location is None:
+                continue
+            deadline = parse_todo_deadline(location.entry["deadline"])
+            widgets.deadline_label.configure(
+                text=deadline.strftime("%Y-%m-%d %H:%M"),
+                fg=(
+                    COLOR_DANGER
+                    if todo_deadline_reached(location.entry, current)
+                    else COLOR_TEXT
+                ),
+            )
+        self._update_summary_label()
+
     def _refresh_todo_selection(self) -> None:
         for widgets in self.todo_row_widgets:
             selected = widgets.entry_id == self.selected_todo_id
@@ -2473,8 +2552,8 @@ class ScheduleApp:
         )
         row.grid(row=row_index, column=0, sticky="ew")
         row.grid_propagate(False)
-        for column in range(8):
-            row.columnconfigure(column, weight=1 if column == 7 else 0)
+        for column in range(7):
+            row.columnconfigure(column, weight=1 if column == 6 else 0)
         row.bind("<Button-1>", lambda _event, item_id=entry_id: self._select(item_id))
         row.bind("<MouseWheel>", self._on_rows_mousewheel)
 
@@ -2639,19 +2718,8 @@ class ScheduleApp:
         delay_label.bind("<Button-1>", lambda _event, item_id=entry_id: self._select(item_id))
         delay_label.bind("<MouseWheel>", self._on_rows_mousewheel)
 
-        complete_button = ttk.Button(
-            row,
-            text=f"✓ {TEXT_COMPLETE}",
-            width=COMPLETE_BUTTON_WIDTH,
-            style="Success.TButton",
-            cursor="hand2",
-            command=lambda item_id=entry_id: self._on_complete(item_id),
-        )
-        complete_button.grid(row=0, column=5, sticky="w", padx=(0, 8))
-        complete_button.bind("<MouseWheel>", self._on_rows_mousewheel)
-
         tk.Frame(row, width=self.splitter_width, bg=COLOR_BORDER).grid(
-            row=0, column=6, sticky="ns"
+            row=0, column=5, sticky="ns"
         )
 
         gantt_canvas = tk.Canvas(
@@ -2660,7 +2728,7 @@ class ScheduleApp:
             background=base_bg,
             highlightthickness=0,
         )
-        gantt_canvas.grid(row=0, column=7, sticky="ew", padx=(0, 4))
+        gantt_canvas.grid(row=0, column=6, sticky="ew", padx=(0, 4))
         gantt_canvas.bind("<Button-1>", lambda _event, item_id=entry_id: self._select(item_id))
         gantt_canvas.bind("<Configure>", lambda _event, item_id=entry_id: self._redraw_gantt_for(item_id))
         gantt_canvas.bind("<MouseWheel>", self._on_rows_mousewheel)
@@ -2678,7 +2746,6 @@ class ScheduleApp:
             progress_canvas,
             started_label,
             delay_label,
-            complete_button,
             gantt_canvas,
         ):
             self._bind_row_context_menu(widget, "schedule", entry_id)
@@ -2698,7 +2765,6 @@ class ScheduleApp:
                 progress_canvas,
                 started_label,
                 delay_label,
-                complete_button,
                 gantt_canvas,
                 base_bg,
             )
@@ -2929,6 +2995,69 @@ class ScheduleApp:
             self._save_or_restore(snapshot)
             self._rebuild_todo_rows()
 
+    def _on_complete_selected_todo(self) -> None:
+        if self.selected_todo_id:
+            self._on_complete_todo(self.selected_todo_id)
+
+    def _on_complete_todo(self, entry_id: str) -> None:
+        location = find_todo(self.schedule, entry_id)
+        if location is None:
+            return
+        entry = location.entry
+        targets = [entry]
+        if location.is_parent:
+            children = entry.get("children", [])
+            targets.extend(children)
+            message = CONFIRM_COMPLETE_TODO_PARENT_MESSAGE.format(
+                task=entry["task"], count=len(children)
+            )
+        else:
+            message = CONFIRM_COMPLETE_TODO_MESSAGE.format(task=entry["task"])
+        if not messagebox.askyesno(CONFIRM_COMPLETE_TITLE, message):
+            return
+
+        snapshot = self._snapshot_schedule()
+        previous_selection = self.selected_todo_id
+        records = [self._todo_completion_record(target) for target in targets]
+        remove_todo(self.schedule, entry_id)
+        self.selected_todo_id = location.parent["id"] if not location.is_parent else None
+        if self.selected_todo_id and find_todo(self.schedule, self.selected_todo_id) is None:
+            self.selected_todo_id = None
+
+        journal = {
+            "version": 1,
+            "records": records,
+            "schedule": serialize_schedule(self.schedule),
+        }
+        journal_path = self._completion_journal_path()
+        try:
+            atomic_write_text(
+                journal_path,
+                json.dumps(journal, ensure_ascii=False, indent=2) + "\n",
+                keep_backup=False,
+            )
+        except Exception as exc:
+            messagebox.showerror(ERROR_INPUT_TITLE, f"{ERROR_COMPLETE_LOG_WRITE}\n{exc}")
+            self._restore_schedule(snapshot)
+            self.selected_todo_id = previous_selection
+            self._rebuild_todo_rows()
+            return
+
+        try:
+            self._finish_completion_transaction(journal)
+        except Exception as exc:
+            messagebox.showerror(ERROR_INPUT_TITLE, f"{ERROR_COMPLETION_RECOVERY}\n{exc}")
+            self._restore_schedule(snapshot)
+            self.selected_todo_id = previous_selection
+            self.load_failed = True
+            self._rebuild_todo_rows()
+            return
+        self._rebuild_todo_rows()
+
+    def _on_complete_selected(self) -> None:
+        if self.selected_id:
+            self._on_complete(self.selected_id)
+
     def _on_complete(self, entry_id: str) -> None:
         location = self._find(entry_id)
         if location is None:
@@ -3136,7 +3265,7 @@ class ScheduleApp:
             anchor="w",
         ).grid(row=3, column=0, sticky="ew", padx=24, pady=(0, 6))
         initial_deadline = location.entry.get("deadline") if is_edit else self.current_jst_date
-        deadline_input = DateInput(
+        deadline_input = DateTimeInput(
             content,
             value=initial_deadline,
             background=COLOR_SURFACE,
@@ -3162,9 +3291,9 @@ class ScheduleApp:
                 messagebox.showerror(ERROR_INPUT_TITLE, ERROR_EMPTY_TASK)
                 return
             try:
-                deadline = deadline_input.get_date()
+                deadline = deadline_input.get_datetime()
             except ValueError:
-                messagebox.showerror(ERROR_INPUT_TITLE, ERROR_INVALID_DATE)
+                messagebox.showerror(ERROR_INPUT_TITLE, ERROR_INVALID_DEADLINE)
                 return
             snapshot = self._snapshot_schedule()
             previous_selection = self.selected_todo_id
