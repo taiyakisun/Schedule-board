@@ -979,6 +979,53 @@ class ScheduleAppTkTests(unittest.TestCase):
         self._pump()
         self.assertFalse(dialog.winfo_exists())
 
+    def test_add_dialogs_are_centered_with_ok_on_left_and_todo_notify_on(self) -> None:
+        self.root.geometry("1280x720+260+80")
+        self._pump()
+
+        for open_dialog in (
+            lambda: self.app._open_entry_dialog(kind="parent"),
+            lambda: self.app._open_todo_dialog(kind="parent"),
+        ):
+            with self.subTest(open_dialog=open_dialog):
+                open_dialog()
+                self._pump()
+                dialog = next(
+                    widget
+                    for widget in self.root.winfo_children()
+                    if isinstance(widget, tk.Toplevel)
+                )
+                expected_x = self.root.winfo_rootx() + (
+                    self.root.winfo_width() - dialog.winfo_width()
+                ) // 2
+                expected_y = self.root.winfo_rooty() + (
+                    self.root.winfo_height() - dialog.winfo_height()
+                ) // 2
+                self.assertEqual(dialog.winfo_x(), expected_x)
+                self.assertEqual(dialog.winfo_y(), expected_y)
+
+                buttons = {
+                    button.cget("text"): button
+                    for button in self._descendants_of_type(dialog, ttk.Button)
+                    if button.cget("text") in (app_module.BUTTON_OK, app_module.BUTTON_CANCEL)
+                }
+                self.assertLess(
+                    buttons[app_module.BUTTON_OK].winfo_rootx(),
+                    buttons[app_module.BUTTON_CANCEL].winfo_rootx(),
+                )
+
+                if dialog.title() == "TODO追加":
+                    notify_check = self._descendants_of_type(
+                        dialog, ttk.Checkbutton
+                    )[0]
+                    self.assertTrue(
+                        self.root.getvar(notify_check.cget("variable"))
+                    )
+
+                buttons[app_module.BUTTON_CANCEL].invoke()
+                self._pump()
+                self.assertFalse(dialog.winfo_exists())
+
     def test_parent_and_child_date_inputs_keep_start_before_end(self) -> None:
         for kind, parent_id in (("parent", None), ("child", self.parent["id"])):
             with self.subTest(kind=kind):

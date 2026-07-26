@@ -3211,6 +3211,13 @@ class ScheduleApp:
         messagebox.showinfo(INFO_EXCEL_EXPORT_TITLE, INFO_EXCEL_EXPORT.format(path=output_path))
 
     # ----- dialog -----
+    def _center_dialog_on_root(self, dlg: tk.Toplevel) -> None:
+        dlg.update_idletasks()
+        self.root.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - dlg.winfo_width()) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - dlg.winfo_height()) // 2
+        dlg.geometry(f"+{x}+{y}")
+
     def _open_todo_dialog(
         self,
         kind: str,
@@ -3244,7 +3251,7 @@ class ScheduleApp:
         ).grid(row=0, column=0, sticky="ew", padx=24, pady=(20, 16))
         task_var = tk.StringVar(value=location.entry.get("task", "") if is_edit else "")
         notify_var = tk.BooleanVar(
-            value=location.entry.get("notify", False) if is_edit else False
+            value=location.entry.get("notify", False) if is_edit else True
         )
         tk.Label(
             content,
@@ -3337,20 +3344,21 @@ class ScheduleApp:
 
         ttk.Button(
             footer,
-            text=BUTTON_CANCEL,
-            command=close_dialog,
-            style="Secondary.TButton",
-        ).grid(row=0, column=1)
-        ttk.Button(
-            footer,
             text=BUTTON_OK,
             command=submit,
             style="Primary.TButton",
+        ).grid(row=0, column=1)
+        ttk.Button(
+            footer,
+            text=BUTTON_CANCEL,
+            command=close_dialog,
+            style="Secondary.TButton",
         ).grid(row=0, column=2, padx=(8, 0))
         dlg.protocol("WM_DELETE_WINDOW", close_dialog)
         dlg.bind("<Escape>", lambda _event: close_dialog())
         dlg.bind("<Return>", lambda _event: submit())
         task_entry.focus_set()
+        self._center_dialog_on_root(dlg)
 
     def _open_settings_dialog(self) -> None:
         dlg = tk.Toplevel(self.root)
@@ -3829,18 +3837,18 @@ class ScheduleApp:
 
         ttk.Button(
             button_box,
-            text=BUTTON_CANCEL,
-            width=10,
-            command=close_dialog,
-            style="Secondary.TButton",
-            cursor="hand2",
-        ).grid(row=0, column=0)
-        ttk.Button(
-            button_box,
             text=BUTTON_OK,
             width=10,
             command=submit,
             style="Primary.TButton",
+            cursor="hand2",
+        ).grid(row=0, column=0)
+        ttk.Button(
+            button_box,
+            text=BUTTON_CANCEL,
+            width=10,
+            command=close_dialog,
+            style="Secondary.TButton",
             cursor="hand2",
         ).grid(
             row=0, column=1, padx=(8, 0)
@@ -3849,12 +3857,7 @@ class ScheduleApp:
         task_entry.focus_set()
         dlg.bind("<Return>", lambda _event: submit())
         dlg.bind("<Escape>", lambda _event: close_dialog())
-
-        dlg.update_idletasks()
-        self.root.update_idletasks()
-        x = self.root.winfo_rootx() + max((self.root.winfo_width() - dlg.winfo_width()) // 2, 0)
-        y = self.root.winfo_rooty() + max((self.root.winfo_height() - dlg.winfo_height()) // 2, 0)
-        dlg.geometry(f"+{x}+{y}")
+        self._center_dialog_on_root(dlg)
 
     # ----- splitter -----
     def _on_splitter_press(self, event: tk.Event) -> None:
