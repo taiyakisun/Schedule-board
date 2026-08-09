@@ -3462,6 +3462,7 @@ class ScheduleApp:
         ).grid(row=3, column=1, sticky="e", padx=(8, 0))
         dlg.protocol("WM_DELETE_WINDOW", close_dialog)
         dlg.bind("<Escape>", lambda _event: close_dialog())
+        self._center_dialog_on_root(dlg)
 
     def _open_entry_dialog(
         self,

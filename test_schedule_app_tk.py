@@ -1026,6 +1026,37 @@ class ScheduleAppTkTests(unittest.TestCase):
                 self._pump()
                 self.assertFalse(dialog.winfo_exists())
 
+    def test_settings_dialog_is_centered_on_parent_window(self) -> None:
+        self.root.geometry("1280x720+260+80")
+        self._pump()
+
+        self.app._open_settings_dialog()
+        self._pump()
+        dialog = next(
+            widget
+            for widget in self.root.winfo_children()
+            if isinstance(widget, tk.Toplevel)
+        )
+        expected_x = self.root.winfo_rootx() + (
+            self.root.winfo_width() - dialog.winfo_width()
+        ) // 2
+        expected_y = self.root.winfo_rooty() + (
+            self.root.winfo_height() - dialog.winfo_height()
+        ) // 2
+
+        self.assertEqual(str(dialog.transient()), str(self.root))
+        self.assertEqual(dialog.winfo_x(), expected_x)
+        self.assertEqual(dialog.winfo_y(), expected_y)
+
+        cancel_button = next(
+            button
+            for button in self._descendants_of_type(dialog, ttk.Button)
+            if button.cget("text") == app_module.BUTTON_CANCEL
+        )
+        cancel_button.invoke()
+        self._pump()
+        self.assertFalse(dialog.winfo_exists())
+
     def test_parent_and_child_date_inputs_keep_start_before_end(self) -> None:
         for kind, parent_id in (("parent", None), ("child", self.parent["id"])):
             with self.subTest(kind=kind):
@@ -1039,6 +1070,7 @@ class ScheduleAppTkTests(unittest.TestCase):
                 date_inputs = self._descendants_of_type(dialog, app_module.DateInput)
                 start_input, end_input = date_inputs[:2]
 
+                end_input.set_date(app_module.date(2026, 8, 4))
                 start_input.set_date(app_module.date(2026, 8, 5))
                 self.assertEqual(end_input.get_date(), app_module.date(2026, 8, 5))
 
