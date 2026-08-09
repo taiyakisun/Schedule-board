@@ -7,6 +7,8 @@ Python標準のTkinter/ttkを使い、落ち着いたニュートラル配色、
 ## 実行方法
 
 - 前提: Python 3.10以降（tkinter同梱）
+- Windowsでは、エクスプローラーで `sch_gantt_main.py` をダブルクリックして起動できます。ダブルクリック起動時は自動的に `pythonw.exe` へ引き継ぐため、コマンドプロンプトの黒い画面は残りません。
+- `Start_ScheduleBoard.vbs` をダブルクリックすると、プロジェクトの仮想環境にある `pythonw.exe` で `sch_gantt_main.py` を直接起動します。黒い画面は表示されず、Pythonファイルの変更は再ビルドなしで次回起動時に反映されます。
 - 実行: `python sch_gantt_main.py`
 - 外部Pythonパッケージは不要です。
 

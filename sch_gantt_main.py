@@ -3,6 +3,7 @@ import ctypes
 import json
 import math
 import os
+import subprocess
 import sys
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -58,6 +59,37 @@ def application_directory() -> str:
 def resource_path(*parts: str) -> str:
     base_path = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base_path, *parts)
+
+
+def relaunch_with_pythonw_on_windows() -> bool:
+    """Windowsでは、コンソールなしのPythonへ引き継ぐ。"""
+    if (
+        sys.platform != "win32"
+        or getattr(sys, "frozen", False)
+        or os.environ.get("SCH_GANTT_PYTHONW") == "1"
+        or os.path.basename(sys.executable).lower() == "pythonw.exe"
+    ):
+        return False
+
+    pythonw_path = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+    if not os.path.isfile(pythonw_path):
+        return False
+
+    environment = os.environ.copy()
+    environment["SCH_GANTT_PYTHONW"] = "1"
+    try:
+        subprocess.Popen(
+            [pythonw_path, os.path.abspath(__file__), *sys.argv[1:]],
+            cwd=application_directory(),
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except OSError:
+        return False
+    return True
 
 
 DATA_FILE = os.path.join(application_directory(), "schedules.json")
@@ -4224,4 +4256,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    if not relaunch_with_pythonw_on_windows():
+        main()

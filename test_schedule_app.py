@@ -63,6 +63,35 @@ class ApplicationResourceTests(unittest.TestCase):
                 os.path.dirname(executable),
             )
 
+    def test_explorer_start_relaunches_with_pythonw(self) -> None:
+        executable = os.path.join("C:\\", "Python", "python.exe")
+        pythonw_path = os.path.join(os.path.dirname(executable), "pythonw.exe")
+        with (
+            patch.object(app_module.sys, "platform", "win32"),
+            patch.object(app_module.sys, "frozen", False, create=True),
+            patch.object(app_module.sys, "executable", executable),
+            patch.object(app_module.sys, "argv", ["sch_gantt_main.py", "--sample"]),
+            patch.object(app_module.os.path, "isfile", return_value=True),
+            patch.object(app_module.subprocess, "Popen") as popen,
+        ):
+            self.assertTrue(app_module.relaunch_with_pythonw_on_windows())
+
+        command = popen.call_args.args[0]
+        self.assertEqual(command[0], pythonw_path)
+        self.assertEqual(command[2:], ["--sample"])
+        self.assertEqual(popen.call_args.kwargs["env"]["SCH_GANTT_PYTHONW"], "1")
+
+    def test_pythonw_start_does_not_relaunch_again(self) -> None:
+        with (
+            patch.object(app_module.sys, "platform", "win32"),
+            patch.object(app_module.sys, "frozen", False, create=True),
+            patch.object(app_module.sys, "executable", os.path.join("C:\\", "Python", "pythonw.exe")),
+            patch.object(app_module.subprocess, "Popen") as popen,
+        ):
+            self.assertFalse(app_module.relaunch_with_pythonw_on_windows())
+
+        popen.assert_not_called()
+
     def test_resource_path_uses_pyinstaller_bundle_directory(self) -> None:
         bundle_dir = os.path.join("C:\\", "bundle")
         with patch.object(app_module.sys, "_MEIPASS", bundle_dir, create=True):
