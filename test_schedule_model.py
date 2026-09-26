@@ -10,12 +10,15 @@ from schedule_model import (
     apply_schedule_sort,
     apply_todo_sort,
     capture_group_order,
+    child_date_overrun_days,
     child_dates_within_parent,
     clamp_children_to_parent,
+    clone_entry_tree,
     delay_days,
     deserialize_schedule,
     effective_started_date,
     effective_visible,
+    expand_parent_to_include_child_dates,
     find_entry,
     find_todo,
     iter_all_todos,
@@ -30,8 +33,10 @@ from schedule_model import (
     progress_ratio,
     progress_text,
     remove_entry,
+    resize_entry_range,
     restore_group_order,
     serialize_schedule,
+    shift_entry_range,
     started_date_for_progress,
     parse_todo_deadline,
     todo_notification_due,
@@ -58,6 +63,151 @@ class ScheduleModelTests(unittest.TestCase):
             parent_id=parent_id,
             entry_id=entry_id,
         )
+
+    def test_child_overrun_days_and_parent_expansion(self) -> None:
+        parent = new_entry(
+            KIND_PARENT,
+            "Parent",
+            "2026-08-22",
+            "2026-08-24",
+            entry_id="parent-1",
+        )
+
+        self.assertEqual(
+            child_date_overrun_days(parent, "2026-08-21", "2026-08-25"),
+            (1, 1),
+        )
+        self.assertTrue(
+            expand_parent_to_include_child_dates(
+                parent,
+                "2026-08-21",
+                "2026-08-25",
+            )
+        )
+        self.assertEqual(
+            (parent["start"], parent["end"]),
+            (date(2026, 8, 21), date(2026, 8, 25)),
+        )
+        self.assertEqual(
+            child_date_overrun_days(parent, "2026-08-22", "2026-08-24"),
+            (0, 0),
+        )
+        self.assertFalse(
+            expand_parent_to_include_child_dates(
+                parent,
+                "2026-08-22",
+                "2026-08-24",
+            )
+        )
+
+    def test_clone_entry_tree_preserves_data_and_renews_parent_child_ids(self) -> None:
+        parent = new_entry(
+            KIND_PARENT,
+            "Parent",
+            "2026-08-22",
+            "2026-08-24",
+            entry_id="parent-original",
+            collapsed=True,
+            progress_value=40,
+            started="2026-08-22",
+        )
+        parent["custom"] = {"value": 3}
+        child = new_entry(
+            KIND_CHILD,
+            "Child",
+            "2026-08-23",
+            "2026-08-24",
+            parent_id=parent["id"],
+            entry_id="child-original",
+            progress_value=25,
+        )
+        child["custom_child"] = ["kept"]
+        parent["children"].append(child)
+
+        cloned = clone_entry_tree(parent)
+
+        self.assertNotEqual(cloned["id"], parent["id"])
+        self.assertNotEqual(cloned["children"][0]["id"], child["id"])
+        self.assertEqual(cloned["children"][0]["parent_id"], cloned["id"])
+        self.assertEqual(cloned["task"], parent["task"])
+        self.assertEqual(cloned["progress_value"], parent["progress_value"])
+        self.assertEqual(cloned["started"], parent["started"])
+        self.assertEqual(cloned["custom"], parent["custom"])
+        self.assertEqual(cloned["children"][0]["custom_child"], ["kept"])
+        cloned["custom"]["value"] = 9
+        self.assertEqual(parent["custom"]["value"], 3)
+
+    def test_shift_entry_range_moves_parent_tree_atomically(self) -> None:
+        parent = new_entry(
+            KIND_PARENT,
+            "Parent",
+            "2026-08-22",
+            "2026-08-24",
+            entry_id="parent-1",
+            started="2026-08-23",
+        )
+        child = new_entry(
+            KIND_CHILD,
+            "Child",
+            "2026-08-23",
+            "2026-08-24",
+            parent_id=parent["id"],
+            entry_id="child-1",
+        )
+        parent["children"].append(child)
+
+        self.assertTrue(shift_entry_range(parent, 3, include_children=True))
+        self.assertEqual(
+            (parent["start"], parent["end"]),
+            (date(2026, 8, 25), date(2026, 8, 27)),
+        )
+        self.assertEqual(
+            (child["start"], child["end"]),
+            (date(2026, 8, 26), date(2026, 8, 27)),
+        )
+        self.assertEqual(parent["started"], date(2026, 8, 23))
+        self.assertFalse(shift_entry_range(parent, 0, include_children=True))
+
+        boundary = new_entry(
+            KIND_PARENT,
+            "Boundary",
+            date.max,
+            date.max,
+            entry_id="boundary",
+        )
+        with self.assertRaises(ValueError):
+            shift_entry_range(boundary, 1)
+        self.assertEqual((boundary["start"], boundary["end"]), (date.max, date.max))
+
+    def test_resize_entry_range_keeps_one_day_and_clamps_parent_children(self) -> None:
+        parent = new_entry(
+            KIND_PARENT,
+            "Parent",
+            "2026-08-22",
+            "2026-08-24",
+            entry_id="parent-1",
+        )
+        child = new_entry(
+            KIND_CHILD,
+            "Child",
+            "2026-08-22",
+            "2026-08-23",
+            parent_id=parent["id"],
+            entry_id="child-1",
+        )
+        parent["children"].append(child)
+
+        self.assertTrue(resize_entry_range(parent, "start", 1))
+        self.assertEqual(parent["start"], date(2026, 8, 23))
+        self.assertEqual(
+            (child["start"], child["end"]),
+            (date(2026, 8, 23), date(2026, 8, 23)),
+        )
+        self.assertTrue(resize_entry_range(parent, "start", 100))
+        self.assertEqual(parent["start"], parent["end"])
+        self.assertFalse(resize_entry_range(parent, "start", 1))
+        with self.assertRaises(ValueError):
+            resize_entry_range(parent, "middle", 1)
 
     def test_child_ranges_are_clamped_to_parent_boundaries(self) -> None:
         parent = new_entry(

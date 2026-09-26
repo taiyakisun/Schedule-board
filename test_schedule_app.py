@@ -153,12 +153,15 @@ class ScheduleAppLogicTests(unittest.TestCase):
         app.schedule = {"version": 2, "parents": parents or []}
         app.entries = app.schedule["parents"]
         app.selected_id = None
+        app.selected_ids = set()
+        app._gantt_drag = None
         app.current_jst_date = app_module.date(2026, 7, 15)
         app.row_widgets = []
         app.header_font = Mock()
         app.header_font.metrics.return_value = 16
         app.small_font = Mock()
         app.small_font.metrics.return_value = 14
+        app.small_font.measure.side_effect = lambda text: len(text) * 7
         app._rebuild_rows = Mock()
         return app
 
@@ -552,8 +555,9 @@ class ScheduleAppLogicTests(unittest.TestCase):
             for item in canvas.create_line.call_args_list
             if item.kwargs.get("fill") == app_module.TODAY_LINE_COLOR
         )
-        self.assertAlmostEqual(today_line.args[0], 104.0)
-        self.assertAlmostEqual(today_line.args[2], 104.0)
+        expected_x = 4 + 300 * (8 / 17)
+        self.assertAlmostEqual(today_line.args[0], expected_x)
+        self.assertAlmostEqual(today_line.args[2], expected_x)
         canvas.winfo_rootx.assert_not_called()
 
     def test_delete_rolls_back_when_schedule_save_fails(self) -> None:
@@ -844,7 +848,7 @@ class ScheduleAppLogicTests(unittest.TestCase):
 
         app._redraw_scale()
 
-        app._redraw_all_gantt.assert_called_once_with()
+        app._redraw_all_gantt.assert_not_called()
 
     def test_scale_header_rows_do_not_overlap(self) -> None:
         year_line_height = 16
@@ -878,7 +882,7 @@ class ScheduleAppLogicTests(unittest.TestCase):
 
         self.assertLess(app.scale_canvas.create_line.call_count, 200)
         self.assertLess(app.scale_canvas.create_text.call_count, 200)
-        app._redraw_all_gantt.assert_called_once_with()
+        app._redraw_all_gantt.assert_not_called()
 
     def test_task_frame_height_is_kept_when_size_propagation_is_disabled(self) -> None:
         app = self.make_app()

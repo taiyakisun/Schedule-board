@@ -5,7 +5,7 @@ import math
 import os
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 import tkinter as tk
 from tkinter import filedialog, font as tkfont, messagebox, ttk
@@ -20,11 +20,13 @@ from schedule_model import (
     apply_schedule_sort,
     apply_todo_sort,
     capture_group_order,
-    child_dates_within_parent,
+    child_date_overrun_days,
     clamp_children_to_parent,
+    clone_entry_tree,
     delay_days,
     deserialize_schedule,
     effective_started_date,
+    expand_parent_to_include_child_dates,
     find_entry,
     find_todo,
     iter_all_todos,
@@ -42,8 +44,10 @@ from schedule_model import (
     parse_todo_deadline,
     remove_entry,
     remove_todo,
+    resize_entry_range,
     restore_group_order,
     serialize_schedule,
+    shift_entry_range,
     started_date_for_progress,
     todo_notification_due,
     todo_deadline_reached,
@@ -132,6 +136,10 @@ ROW_CONTENT_MIN_HEIGHT = 30
 ROW_CONTENT_DEFAULT_HEIGHT = 40
 DRAG_HANDLE_TEXT = "↕"
 DRAG_START_THRESHOLD = 5
+CONTROL_STATE_MASK = 0x0004
+STATUS_MESSAGE_MS = 3_000
+GANTT_RANGE_PADDING_DAYS = 7
+GANTT_EDGE_HIT_PX = 8
 
 SCHEDULE_SORT_OPTIONS = (
     (SORT_NONE, "ソートなし", "なし"),
@@ -198,7 +206,8 @@ BUTTON_OK = "OK"
 BUTTON_CANCEL = "キャンセル"
 
 ERROR_INPUT_TITLE = "入力エラー"
-ERROR_CHILD_OUTSIDE_PARENT = "子スケジュールの開始日と終了日は、親スケジュールの期間内で指定してください。"
+CHILD_START_OVERRUN_MESSAGE = "親スケジュールの開始日より前に{days}日はみ出しています。"
+CHILD_END_OVERRUN_MESSAGE = "親スケジュールの終了日より後に{days}日はみ出しています。"
 ERROR_EMPTY_TASK = "タスク名を入力してください。"
 ERROR_INVALID_DATE = "日付はYYYY-MM-DD形式で入力してください。"
 ERROR_INVALID_DEADLINE = "期限は有効な日付と時刻（時・分）で入力してください。"
@@ -274,6 +283,8 @@ COLOR_WARNING = "#92400E"
 COLOR_WARNING_SOFT = "#FFFBEB"
 COLOR_PARENT_REMAINING = "#C7D2FE"
 COLOR_PARENT_COMPLETE = "#5B5CE2"
+COLOR_PARENT_WITHOUT_CHILDREN_REMAINING = "#BFDBFE"
+COLOR_PARENT_WITHOUT_CHILDREN_COMPLETE = "#2563EB"
 COLOR_CHILD_REMAINING = "#BDEBDD"
 COLOR_CHILD_COMPLETE = "#0F9F6E"
 COLOR_WEEKEND = "#F7F6F3"
@@ -513,6 +524,7 @@ class RowWidgets:
     delay_label: tk.Label
     gantt_canvas: tk.Canvas
     base_bg: str
+    gantt_bounds: tuple[float, float, float, float] | None = None
 
 
 @dataclass
@@ -540,6 +552,25 @@ class RowDragState:
     placeholder: tk.Frame | None = None
 
 
+@dataclass
+class GanttDragState:
+    entry_id: str
+    operation: str
+    start_root_x: int
+    pixels_per_day: float
+    root_entry_ids: tuple[str, ...]
+    moved_entry_ids: tuple[str, ...]
+    original_ranges: dict[str, tuple[date, date]]
+    min_delta: int
+    max_delta: int
+    previous_selected_id: str | None
+    previous_selected_ids: set[str]
+    collapse_on_click: bool = False
+    active: bool = False
+    delta_days: int = 0
+    preview_ranges: dict[str, tuple[date, date]] = field(default_factory=dict)
+
+
 class ScheduleApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -560,11 +591,20 @@ class ScheduleApp:
         self.todos: list[dict] = self.schedule["todos"]
         self.load_failed = False
         self.row_widgets: list[RowWidgets] = []
+        self._row_widgets_by_id: dict[str, RowWidgets] = {}
+        self._row_entries_by_id: dict[str, tuple[dict, dict]] = {}
+        self._rendered_selected_ids: set[str] = set()
+        self._rendered_primary_id: str | None = None
+        self._render_timeline_range: tuple[date | None, date | None] | None = None
         self.todo_row_widgets: list[TodoRowWidgets] = []
         self.selected_id: str | None = None
+        self.selected_ids: set[str] = set()
         self.selected_todo_id: str | None = None
         self.active_mode = "schedule"
         self._row_drag: RowDragState | None = None
+        self._gantt_drag: GanttDragState | None = None
+        self._schedule_clipboard: list[dict] = []
+        self._status_after_id: str | None = None
         self._after_ids: set[str] = set()
 
         self.task_font = tkfont.nametofont("TkDefaultFont")
@@ -594,6 +634,8 @@ class ScheduleApp:
         self._build_ui()
         self.root.bind("<Escape>", self._on_row_drag_escape, add="+")
         self.root.bind("<Destroy>", self._on_root_destroy, add="+")
+        self.root.bind_all("<Control-c>", self._on_copy_shortcut, add="+")
+        self.root.bind_all("<Control-v>", self._on_paste_shortcut, add="+")
         self.root.protocol("WM_DELETE_WINDOW", self._on_close_requested)
         self._load()
         self._ensure_schedule_defaults()
@@ -829,6 +871,27 @@ class ScheduleApp:
         after_id = self.root.after_idle(run_callback)
         self._after_ids.add(after_id)
         return after_id
+
+    def _show_status(self, message: str) -> None:
+        if not hasattr(self, "status_label"):
+            return
+        if self._status_after_id is not None:
+            try:
+                self.root.after_cancel(self._status_after_id)
+            except tk.TclError:
+                pass
+            self._after_ids.discard(self._status_after_id)
+        self.status_label.configure(text=message)
+
+        def clear_status() -> None:
+            self._status_after_id = None
+            if self.status_label.winfo_exists():
+                self.status_label.configure(text="")
+
+        self._status_after_id = self._schedule_after(
+            STATUS_MESSAGE_MS,
+            clear_status,
+        )
 
     def _on_root_destroy(self, event: tk.Event) -> None:
         if event.widget is not self.root:
@@ -1360,6 +1423,21 @@ class ScheduleApp:
             pady=3,
         )
         self.today_label.grid(row=0, column=1, sticky="e", padx=(12, 0))
+        self.status_label = tk.Label(
+            overview_frame,
+            text="",
+            bg=COLOR_SURFACE,
+            fg=COLOR_PRIMARY,
+            font=self.small_font,
+            anchor="e",
+        )
+        self.status_label.grid(
+            row=1,
+            column=0,
+            columnspan=2,
+            sticky="e",
+            pady=(3, 0),
+        )
 
         ttk.Separator(topbar, orient="horizontal").grid(
             row=1, column=0, columnspan=2, sticky="ew", padx=20, pady=(8, 0)
@@ -1783,6 +1861,7 @@ class ScheduleApp:
         if mode not in ("schedule", "todo"):
             return
         self._cancel_row_drag()
+        self._cancel_gantt_drag()
         self.active_mode = mode
         schedule_active = mode == "schedule"
         for is_active, frame, label, indicator in (
@@ -1878,6 +1957,424 @@ class ScheduleApp:
         finally:
             menu.grab_release()
         return "break"
+
+    # ----- gantt interaction -----
+    def _row_widgets_for(self, entry_id: str) -> RowWidgets | None:
+        cached = getattr(self, "_row_widgets_by_id", {}).get(entry_id)
+        if cached is not None:
+            return cached
+        return next(
+            (widgets for widgets in self.row_widgets if widgets.entry_id == entry_id),
+            None,
+        )
+
+    def _row_entry_for(self, entry_id: str) -> tuple[dict, dict] | None:
+        cached = getattr(self, "_row_entries_by_id", {}).get(entry_id)
+        if cached is not None:
+            return cached
+        location = self._find(entry_id)
+        if location is None:
+            return None
+        return location.entry, location.parent
+
+    def _gantt_hit_operation(
+        self,
+        widgets: RowWidgets,
+        x: float,
+        y: float,
+    ) -> str | None:
+        bounds = widgets.gantt_bounds
+        if bounds is None:
+            return None
+        x0, y0, x1, y1 = bounds
+        if not y0 <= y <= y1:
+            return None
+        if x1 - x0 <= GANTT_EDGE_HIT_PX * 2:
+            if x0 <= x <= x1:
+                return "move"
+            if x0 - GANTT_EDGE_HIT_PX <= x < x0:
+                return "resize_start"
+            if x1 < x <= x1 + GANTT_EDGE_HIT_PX:
+                return "resize_end"
+            return None
+        if not x0 <= x <= x1:
+            return None
+        if x - x0 <= GANTT_EDGE_HIT_PX:
+            return "resize_start"
+        if x1 - x <= GANTT_EDGE_HIT_PX:
+            return "resize_end"
+        return "move"
+
+    def _gantt_drag_roots(self, clicked_id: str) -> tuple[str, ...]:
+        ordered = self._ordered_selected_ids()
+        if clicked_id not in ordered:
+            ordered = [clicked_id]
+        selected = set(ordered)
+        roots = []
+        for entry_id in ordered:
+            location = self._find(entry_id)
+            if location is None:
+                continue
+            if not location.is_parent and location.parent["id"] in selected:
+                continue
+            roots.append(entry_id)
+        return tuple(roots)
+
+    def _gantt_moved_ids(self, root_ids: tuple[str, ...]) -> tuple[str, ...]:
+        moved_ids = []
+        seen = set()
+        for entry_id in root_ids:
+            location = self._find(entry_id)
+            if location is None:
+                continue
+            entries = [location.entry]
+            if location.is_parent:
+                entries.extend(location.entry.get("children", []))
+            for entry in entries:
+                if entry["id"] not in seen:
+                    seen.add(entry["id"])
+                    moved_ids.append(entry["id"])
+        return tuple(moved_ids)
+
+    def _gantt_original_ranges(
+        self,
+        entry_id: str,
+        operation: str,
+        root_ids: tuple[str, ...],
+        moved_ids: tuple[str, ...],
+    ) -> dict[str, tuple[date, date]]:
+        included_ids = set(moved_ids)
+        if operation == "move":
+            for root_id in root_ids:
+                location = self._find(root_id)
+                if location is not None and not location.is_parent:
+                    included_ids.add(location.parent["id"])
+        else:
+            location = self._find(entry_id)
+            if location is not None:
+                included_ids.add(location.parent["id"])
+                if location.is_parent:
+                    included_ids.update(
+                        child["id"] for child in location.entry.get("children", [])
+                    )
+        ranges = {}
+        for candidate_id in included_ids:
+            location = self._find(candidate_id)
+            if location is not None:
+                ranges[candidate_id] = (
+                    location.entry["start"],
+                    location.entry["end"],
+                )
+        return ranges
+
+    def _gantt_delta_limits(
+        self,
+        entry_id: str,
+        operation: str,
+        moved_ids: tuple[str, ...],
+    ) -> tuple[int, int]:
+        if operation == "move":
+            ranges = [
+                self._find(candidate_id).entry
+                for candidate_id in moved_ids
+                if self._find(candidate_id) is not None
+            ]
+            return (
+                max(1 - entry["start"].toordinal() for entry in ranges),
+                min(date.max.toordinal() - entry["end"].toordinal() for entry in ranges),
+            )
+        location = self._find(entry_id)
+        if location is None:
+            return 0, 0
+        entry = location.entry
+        if operation == "resize_start":
+            return (
+                1 - entry["start"].toordinal(),
+                (entry["end"] - entry["start"]).days,
+            )
+        return (
+            -(entry["end"] - entry["start"]).days,
+            date.max.toordinal() - entry["end"].toordinal(),
+        )
+
+    def _update_gantt_preview(self, state: GanttDragState) -> None:
+        ranges = dict(state.original_ranges)
+        delta = state.delta_days
+        moved = set(state.moved_entry_ids)
+        if state.operation == "move":
+            for entry_id in state.moved_entry_ids:
+                start, end = state.original_ranges[entry_id]
+                ranges[entry_id] = (
+                    date.fromordinal(start.toordinal() + delta),
+                    date.fromordinal(end.toordinal() + delta),
+                )
+            for root_id in state.root_entry_ids:
+                location = self._find(root_id)
+                if location is None or location.is_parent:
+                    continue
+                parent_id = location.parent["id"]
+                if parent_id in moved:
+                    continue
+                parent_start, parent_end = ranges[parent_id]
+                child_start, child_end = ranges[root_id]
+                ranges[parent_id] = (
+                    min(parent_start, child_start),
+                    max(parent_end, child_end),
+                )
+        else:
+            location = self._find(state.entry_id)
+            if location is None:
+                state.preview_ranges = ranges
+                return
+            start, end = state.original_ranges[state.entry_id]
+            if state.operation == "resize_start":
+                start = date.fromordinal(start.toordinal() + delta)
+            else:
+                end = date.fromordinal(end.toordinal() + delta)
+            ranges[state.entry_id] = (start, end)
+            if location.is_parent:
+                for child in location.entry.get("children", []):
+                    child_start, child_end = state.original_ranges[child["id"]]
+                    ranges[child["id"]] = (
+                        min(max(child_start, start), end),
+                        min(max(child_end, start), end),
+                    )
+            else:
+                parent_id = location.parent["id"]
+                parent_start, parent_end = state.original_ranges[parent_id]
+                ranges[parent_id] = (
+                    min(parent_start, start),
+                    max(parent_end, end),
+                )
+        state.preview_ranges = ranges
+
+    def _on_gantt_press(
+        self,
+        entry_id: str,
+        event: tk.Event,
+    ) -> str:
+        self._cancel_gantt_drag(redraw=False)
+        widgets = self._row_widgets_for(entry_id)
+        if widgets is None:
+            return "break"
+        previous_selected_id = self.selected_id
+        previous_selected_ids = set(self.selected_ids)
+        operation = self._gantt_hit_operation(widgets, event.x, event.y)
+        additive = bool(getattr(event, "state", 0) & CONTROL_STATE_MASK)
+        collapse_on_click = False
+        if additive:
+            self._select(entry_id, additive=True)
+        elif self._is_selected(entry_id) and len(self.selected_ids) > 1:
+            self.selected_id = entry_id
+            self._refresh_selection()
+            collapse_on_click = True
+        else:
+            self._select(entry_id)
+        if operation is None:
+            if collapse_on_click:
+                self._select(entry_id)
+            return "break"
+        if not self._is_selected(entry_id):
+            return "break"
+
+        geometry = self._gantt_geometry(widgets.gantt_canvas.winfo_width())
+        if geometry is None:
+            return "break"
+        root_ids = (
+            self._gantt_drag_roots(entry_id)
+            if operation == "move"
+            else (entry_id,)
+        )
+        moved_ids = self._gantt_moved_ids(root_ids)
+        original_ranges = self._gantt_original_ranges(
+            entry_id,
+            operation,
+            root_ids,
+            moved_ids,
+        )
+        min_delta, max_delta = self._gantt_delta_limits(
+            entry_id,
+            operation,
+            moved_ids,
+        )
+        self._gantt_drag = GanttDragState(
+            entry_id=entry_id,
+            operation=operation,
+            start_root_x=event.x_root,
+            pixels_per_day=geometry[-1],
+            root_entry_ids=root_ids,
+            moved_entry_ids=moved_ids,
+            original_ranges=original_ranges,
+            min_delta=min_delta,
+            max_delta=max_delta,
+            previous_selected_id=previous_selected_id,
+            previous_selected_ids=previous_selected_ids,
+            collapse_on_click=collapse_on_click,
+        )
+        return "break"
+
+    def _on_gantt_motion(self, entry_id: str, event: tk.Event) -> str:
+        state = self._gantt_drag
+        if state is None or state.entry_id != entry_id:
+            return "break"
+        distance = event.x_root - state.start_root_x
+        if not state.active and abs(distance) < DRAG_START_THRESHOLD:
+            return "break"
+        requested = round(distance / max(state.pixels_per_day, 0.001))
+        delta = max(state.min_delta, min(state.max_delta, requested))
+        if state.active and delta == state.delta_days:
+            return "break"
+        state.active = True
+        state.delta_days = delta
+        self._update_gantt_preview(state)
+        self.root.configure(
+            cursor=(
+                "fleur"
+                if state.operation == "move"
+                else "sb_h_double_arrow"
+            )
+        )
+        self.status_label.configure(text=f"日付変更: {delta:+d}日")
+        self._redraw_gantt_entries(state.preview_ranges)
+        return "break"
+
+    def _commit_gantt_drag(self, state: GanttDragState) -> bool:
+        snapshot = self._snapshot_schedule()
+        try:
+            if state.operation == "move":
+                for root_id in state.root_entry_ids:
+                    location = self._find(root_id)
+                    if location is None:
+                        continue
+                    shift_entry_range(
+                        location.entry,
+                        state.delta_days,
+                        include_children=location.is_parent,
+                    )
+                for root_id in state.root_entry_ids:
+                    location = self._find(root_id)
+                    if location is not None and not location.is_parent:
+                        expand_parent_to_include_child_dates(
+                            location.parent,
+                            location.entry["start"],
+                            location.entry["end"],
+                        )
+            else:
+                location = self._find(state.entry_id)
+                if location is None:
+                    return False
+                edge = "start" if state.operation == "resize_start" else "end"
+                resize_entry_range(location.entry, edge, state.delta_days)
+                if not location.is_parent:
+                    expand_parent_to_include_child_dates(
+                        location.parent,
+                        location.entry["start"],
+                        location.entry["end"],
+                    )
+        except ValueError as exc:
+            self._restore_schedule(snapshot)
+            self.selected_id = state.previous_selected_id
+            self.selected_ids = state.previous_selected_ids
+            self._refresh_row_entry_cache()
+            self._refresh_selection()
+            self._refresh_delay_labels()
+            self._redraw_scale()
+            self._redraw_all_gantt()
+            self._show_status(str(exc))
+            return False
+        saved = self._save_or_restore(snapshot)
+        if not saved:
+            self.selected_id = state.previous_selected_id
+            self.selected_ids = state.previous_selected_ids
+            self._refresh_row_entry_cache()
+            self._refresh_selection()
+        self._refresh_delay_labels()
+        self._redraw_scale()
+        self._redraw_all_gantt()
+        if saved:
+            self._show_status(f"予定を{state.delta_days:+d}日変更しました。")
+        else:
+            self._show_status("日付変更を元に戻しました。")
+        return saved
+
+    def _on_gantt_release(self, entry_id: str, _event: tk.Event) -> str:
+        state = self._gantt_drag
+        if state is None or state.entry_id != entry_id:
+            return "break"
+        should_commit = state.active and state.delta_days != 0
+        preview_ids = tuple(state.preview_ranges)
+        self._gantt_drag = None
+        self.root.configure(cursor="")
+        if should_commit:
+            self._commit_gantt_drag(state)
+        else:
+            if state.collapse_on_click:
+                self._select(entry_id)
+            self.status_label.configure(text="")
+            self._redraw_gantt_entries(preview_ids)
+        return "break"
+
+    def _cancel_gantt_drag(self, *, redraw: bool = True) -> None:
+        if self._gantt_drag is None:
+            return
+        preview_ids = tuple(self._gantt_drag.preview_ranges)
+        self._gantt_drag = None
+        self.root.configure(cursor="")
+        self.status_label.configure(text="")
+        if redraw:
+            self._redraw_gantt_entries(preview_ids)
+
+    def _on_gantt_double_click(self, entry_id: str, event: tk.Event) -> str:
+        widgets = self._row_widgets_for(entry_id)
+        if widgets is None or self._gantt_hit_operation(widgets, event.x, event.y) is None:
+            return "break"
+        self._cancel_gantt_drag(redraw=False)
+        self._select(entry_id)
+        self._on_edit(entry_id)
+        return "break"
+
+    def _on_gantt_hover(self, entry_id: str, event: tk.Event) -> None:
+        if self._gantt_drag is not None:
+            return
+        widgets = self._row_widgets_for(entry_id)
+        if widgets is None:
+            return
+        operation = self._gantt_hit_operation(widgets, event.x, event.y)
+        widgets.gantt_canvas.configure(
+            cursor=(
+                "fleur"
+                if operation == "move"
+                else "sb_h_double_arrow"
+                if operation in ("resize_start", "resize_end")
+                else "arrow"
+            )
+        )
+
+    def _bind_gantt_canvas(self, canvas: tk.Canvas, entry_id: str) -> None:
+        canvas.bind(
+            "<ButtonPress-1>",
+            lambda event, item_id=entry_id: self._on_gantt_press(item_id, event),
+        )
+        canvas.bind(
+            "<B1-Motion>",
+            lambda event, item_id=entry_id: self._on_gantt_motion(item_id, event),
+        )
+        canvas.bind(
+            "<ButtonRelease-1>",
+            lambda event, item_id=entry_id: self._on_gantt_release(item_id, event),
+        )
+        canvas.bind(
+            "<Double-1>",
+            lambda event, item_id=entry_id: self._on_gantt_double_click(
+                item_id,
+                event,
+            ),
+        )
+        canvas.bind(
+            "<Motion>",
+            lambda event, item_id=entry_id: self._on_gantt_hover(item_id, event),
+        )
+        canvas.bind("<Leave>", lambda _event: canvas.configure(cursor="arrow"))
 
     # ----- drag and drop ordering -----
     def _bind_row_drag_handle(
@@ -2097,10 +2594,14 @@ class ScheduleApp:
         self.root.configure(cursor="")
 
     def _on_row_drag_escape(self, _event: tk.Event | None = None) -> str | None:
-        if self._row_drag is None:
-            return None
-        self._cancel_row_drag()
-        return "break"
+        handled = False
+        if self._row_drag is not None:
+            self._cancel_row_drag()
+            handled = True
+        if self._gantt_drag is not None:
+            self._cancel_gantt_drag()
+            handled = True
+        return "break" if handled else None
 
     def _on_row_drag_press(
         self,
@@ -2214,12 +2715,10 @@ class ScheduleApp:
 
     def _on_rows_container_configure(self, _event: tk.Event) -> None:
         self._update_canvas_scrollregion(self.rows_canvas)
-        self._redraw_all_gantt()
 
     def _on_rows_canvas_configure(self, event: tk.Event) -> None:
         self.rows_canvas.itemconfigure(self.rows_window, width=event.width)
         self._update_canvas_scrollregion(self.rows_canvas)
-        self._redraw_all_gantt()
 
     def _on_todo_rows_canvas_configure(self, event: tk.Event) -> None:
         self.todo_rows_canvas.itemconfigure(self.todo_rows_window, width=event.width)
@@ -2287,14 +2786,29 @@ class ScheduleApp:
     def _clear_rows(self) -> None:
         if self._row_drag is not None and self._row_drag.mode == "schedule":
             self._cancel_row_drag()
+        self._cancel_gantt_drag(redraw=False)
         for child in self.rows_container.winfo_children():
             child.destroy()
         self.row_widgets.clear()
+        self._row_widgets_by_id.clear()
+        self._row_entries_by_id.clear()
+        self._rendered_selected_ids.clear()
+        self._rendered_primary_id = None
+
+    def _refresh_row_entry_cache(self) -> None:
+        self._row_entries_by_id = {
+            entry["id"]: (entry, parent)
+            for entry, parent in self._display_items()
+        }
 
     def _rebuild_rows(self) -> None:
         self._update_progress_column_width()
         self._clear_rows()
         display_items = self._display_items()
+        self._row_entries_by_id = {
+            entry["id"]: (entry, parent)
+            for entry, parent in display_items
+        }
         for row_index, (entry, parent) in enumerate(display_items):
             self._add_row(row_index, entry, parent)
         if not display_items:
@@ -2586,7 +3100,10 @@ class ScheduleApp:
         row.grid_propagate(False)
         for column in range(7):
             row.columnconfigure(column, weight=1 if column == 6 else 0)
-        row.bind("<Button-1>", lambda _event, item_id=entry_id: self._select(item_id))
+        row.bind(
+            "<Button-1>",
+            lambda event, item_id=entry_id: self._select_from_event(item_id, event),
+        )
         row.bind("<MouseWheel>", self._on_rows_mousewheel)
 
         selection_bar = tk.Frame(row, width=4, bg=base_bg)
@@ -2626,7 +3143,10 @@ class ScheduleApp:
         task_frame.grid(row=0, column=1, sticky="nsew", padx=(0, 8))
         task_frame.columnconfigure(2, weight=1)
         task_frame.grid_propagate(False)
-        task_frame.bind("<Button-1>", lambda _event, item_id=entry_id: self._select(item_id))
+        task_frame.bind(
+            "<Button-1>",
+            lambda event, item_id=entry_id: self._select_from_event(item_id, event),
+        )
         task_frame.bind("<MouseWheel>", self._on_rows_mousewheel)
 
         drag_handle = tk.Label(
@@ -2655,7 +3175,11 @@ class ScheduleApp:
             )
             tree_indicator.grid(row=0, column=1, sticky="w", padx=(22, 6))
             tree_indicator.bind(
-                "<Button-1>", lambda _event, item_id=entry_id: self._select(item_id)
+                "<Button-1>",
+                lambda event, item_id=entry_id: self._select_from_event(
+                    item_id,
+                    event,
+                ),
             )
         else:
             has_children = bool(entry.get("children"))
@@ -2689,7 +3213,10 @@ class ScheduleApp:
             fg=COLOR_TEXT,
         )
         task_label.grid(row=0, column=2, sticky="nsew")
-        task_label.bind("<Button-1>", lambda _event, item_id=entry_id: self._select(item_id))
+        task_label.bind(
+            "<Button-1>",
+            lambda event, item_id=entry_id: self._select_from_event(item_id, event),
+        )
         task_label.bind("<Double-1>", lambda _event, item_id=entry_id: self._on_edit(item_id))
         task_label.bind("<MouseWheel>", self._on_rows_mousewheel)
 
@@ -2705,7 +3232,10 @@ class ScheduleApp:
             font=self.small_font,
         )
         progress_label.grid(row=0, column=0, sticky="ew")
-        progress_label.bind("<Button-1>", lambda _event, item_id=entry_id: self._select(item_id))
+        progress_label.bind(
+            "<Button-1>",
+            lambda event, item_id=entry_id: self._select_from_event(item_id, event),
+        )
         progress_label.bind("<Double-1>", lambda _event, item_id=entry_id: self._on_edit(item_id))
         progress_label.bind("<MouseWheel>", self._on_rows_mousewheel)
         progress_canvas = tk.Canvas(
@@ -2721,7 +3251,8 @@ class ScheduleApp:
             lambda _event, item_id=entry_id: self._draw_progress_indicator(item_id),
         )
         progress_canvas.bind(
-            "<Button-1>", lambda _event, item_id=entry_id: self._select(item_id)
+            "<Button-1>",
+            lambda event, item_id=entry_id: self._select_from_event(item_id, event),
         )
         progress_canvas.bind("<MouseWheel>", self._on_rows_mousewheel)
 
@@ -2735,7 +3266,10 @@ class ScheduleApp:
             font=self.small_font,
         )
         started_label.grid(row=0, column=3, sticky="ew", padx=(0, 8))
-        started_label.bind("<Button-1>", lambda _event, item_id=entry_id: self._select(item_id))
+        started_label.bind(
+            "<Button-1>",
+            lambda event, item_id=entry_id: self._select_from_event(item_id, event),
+        )
         started_label.bind("<Double-1>", lambda _event, item_id=entry_id: self._on_edit(item_id))
         started_label.bind("<MouseWheel>", self._on_rows_mousewheel)
 
@@ -2747,7 +3281,10 @@ class ScheduleApp:
             font=self.small_font,
         )
         delay_label.grid(row=0, column=4, sticky="ew", padx=(0, 8))
-        delay_label.bind("<Button-1>", lambda _event, item_id=entry_id: self._select(item_id))
+        delay_label.bind(
+            "<Button-1>",
+            lambda event, item_id=entry_id: self._select_from_event(item_id, event),
+        )
         delay_label.bind("<MouseWheel>", self._on_rows_mousewheel)
 
         tk.Frame(row, width=self.splitter_width, bg=COLOR_BORDER).grid(
@@ -2761,7 +3298,7 @@ class ScheduleApp:
             highlightthickness=0,
         )
         gantt_canvas.grid(row=0, column=6, sticky="ew", padx=(0, 4))
-        gantt_canvas.bind("<Button-1>", lambda _event, item_id=entry_id: self._select(item_id))
+        self._bind_gantt_canvas(gantt_canvas, entry_id)
         gantt_canvas.bind("<Configure>", lambda _event, item_id=entry_id: self._redraw_gantt_for(item_id))
         gantt_canvas.bind("<MouseWheel>", self._on_rows_mousewheel)
 
@@ -2782,38 +3319,41 @@ class ScheduleApp:
         ):
             self._bind_row_context_menu(widget, "schedule", entry_id)
 
-        self.row_widgets.append(
-            RowWidgets(
-                entry_id,
-                row,
-                selection_bar,
-                drag_handle,
-                vis_label,
-                task_frame,
-                tree_indicator,
-                task_label,
-                progress_frame,
-                progress_label,
-                progress_canvas,
-                started_label,
-                delay_label,
-                gantt_canvas,
-                base_bg,
-            )
+        widgets = RowWidgets(
+            entry_id,
+            row,
+            selection_bar,
+            drag_handle,
+            vis_label,
+            task_frame,
+            tree_indicator,
+            task_label,
+            progress_frame,
+            progress_label,
+            progress_canvas,
+            started_label,
+            delay_label,
+            gantt_canvas,
+            base_bg,
         )
-        self.root.after_idle(lambda item_id=entry_id: self._draw_progress_indicator(item_id))
+        self.row_widgets.append(widgets)
+        self._row_widgets_by_id[entry_id] = widgets
+        self._schedule_after_idle(
+            lambda item_id=entry_id: self._draw_progress_indicator(item_id)
+        )
 
     def _draw_progress_indicator(self, entry_id: str) -> None:
-        widgets = next((item for item in self.row_widgets if item.entry_id == entry_id), None)
-        location = self._find(entry_id)
-        if widgets is None or location is None:
+        widgets = self._row_widgets_for(entry_id)
+        row_entry = self._row_entry_for(entry_id)
+        if widgets is None or row_entry is None:
             return
+        entry, _parent = row_entry
         canvas = widgets.progress_canvas
         canvas.delete("all")
         width = canvas.winfo_width()
         if width <= 2:
             return
-        ratio = progress_ratio(location.entry)
+        ratio = progress_ratio(entry)
         create_rounded_rectangle(
             canvas,
             0,
@@ -2824,7 +3364,7 @@ class ScheduleApp:
             fill=COLOR_BORDER_SOFT,
             outline="",
         )
-        fill = COLOR_PARENT_COMPLETE if location.entry["kind"] == "parent" else COLOR_CHILD_COMPLETE
+        fill = COLOR_PARENT_COMPLETE if entry["kind"] == "parent" else COLOR_CHILD_COMPLETE
         if ratio > 0:
             create_rounded_rectangle(
                 canvas,
@@ -2838,20 +3378,80 @@ class ScheduleApp:
             )
 
     # ----- selection -----
-    def _select(self, entry_id: str) -> None:
+    def _ordered_selected_ids(self) -> list[str]:
+        selected_ids = getattr(self, "selected_ids", set())
+        return [
+            entry["id"]
+            for entry in iter_all_entries(self.schedule)
+            if entry["id"] in selected_ids
+        ]
+
+    def _normalize_schedule_selection(self) -> None:
+        if not hasattr(self, "selected_ids"):
+            self.selected_ids = set()
+        valid_ids = {entry["id"] for entry in iter_all_entries(self.schedule)}
+        self.selected_ids.intersection_update(valid_ids)
+        if self.selected_id not in valid_ids:
+            self.selected_id = None
+        if self.selected_id is not None:
+            self.selected_ids.add(self.selected_id)
+        elif self.selected_ids:
+            self.selected_id = self._ordered_selected_ids()[-1]
+
+    def _is_selected(self, entry_id: str) -> bool:
+        return entry_id in getattr(self, "selected_ids", set()) or entry_id == getattr(
+            self,
+            "selected_id",
+            None,
+        )
+
+    def _select(self, entry_id: str, *, additive: bool = False) -> None:
         if self._find(entry_id) is None:
             return
-        self.selected_id = entry_id
+        if additive:
+            if entry_id in self.selected_ids:
+                self.selected_ids.remove(entry_id)
+                if self.selected_id == entry_id:
+                    ordered = self._ordered_selected_ids()
+                    self.selected_id = ordered[-1] if ordered else None
+            else:
+                self.selected_ids.add(entry_id)
+                self.selected_id = entry_id
+        else:
+            self.selected_id = entry_id
+            self.selected_ids = {entry_id}
         self._refresh_selection()
 
+    def _select_from_event(self, entry_id: str, event: tk.Event) -> None:
+        self._select(
+            entry_id,
+            additive=bool(getattr(event, "state", 0) & CONTROL_STATE_MASK),
+        )
+
     def _refresh_selection(self) -> None:
-        for widgets in self.row_widgets:
-            is_selected = widgets.entry_id == self.selected_id
+        self._normalize_schedule_selection()
+        selected_ids = set(self.selected_ids)
+        rendered_ids = getattr(self, "_rendered_selected_ids", set())
+        rendered_primary = getattr(self, "_rendered_primary_id", None)
+        changed_ids = selected_ids.symmetric_difference(rendered_ids)
+        if rendered_primary is not None:
+            changed_ids.add(rendered_primary)
+        if self.selected_id is not None:
+            changed_ids.add(self.selected_id)
+
+        redraw_ids = []
+        for entry_id in changed_ids:
+            widgets = self._row_widgets_for(entry_id)
+            row_entry = self._row_entry_for(entry_id)
+            if widgets is None or row_entry is None:
+                continue
+            entry, parent = row_entry
+            is_selected = entry_id in selected_ids
+            is_primary = entry_id == self.selected_id
             bg = COLOR_PRIMARY_SOFT if is_selected else widgets.base_bg
-            location = self._find(widgets.entry_id)
             visibility_bg = bg
-            if not is_selected and location is not None:
-                visibility_text = self._visibility_text(location.entry, location.parent)
+            if not is_selected:
+                visibility_text = self._visibility_text(entry, parent)
                 if visibility_text == VISIBLE_TEXT:
                     visibility_bg = COLOR_SUCCESS_SOFT
                 elif visibility_text == PARENT_HIDDEN_TEXT:
@@ -2859,7 +3459,13 @@ class ScheduleApp:
                 else:
                     visibility_bg = COLOR_HEADER
             widgets.container.configure(bg=bg)
-            widgets.selection_bar.configure(bg=COLOR_PRIMARY if is_selected else bg)
+            widgets.selection_bar.configure(
+                bg=(
+                    COLOR_PRIMARY
+                    if is_primary
+                    else COLOR_PRIMARY_HOVER if is_selected else bg
+                )
+            )
             widgets.visibility_label.configure(bg=visibility_bg)
             widgets.task_frame.configure(bg=bg)
             widgets.drag_handle.configure(bg=bg)
@@ -2869,12 +3475,130 @@ class ScheduleApp:
             widgets.progress_label.configure(bg=bg)
             widgets.progress_canvas.configure(bg=bg)
             widgets.started_label.configure(bg=bg)
-            widgets.delay_label.configure(bg=bg)
+            delay_days = self._delay_days(entry)
+            widgets.delay_label.configure(
+                bg=(
+                    bg
+                    if is_selected
+                    else COLOR_DANGER_SOFT if delay_days else widgets.base_bg
+                )
+            )
             widgets.gantt_canvas.configure(
                 bg=COLOR_SELECTED_GANTT if is_selected else widgets.base_bg
             )
-            self._draw_progress_indicator(widgets.entry_id)
-            self._redraw_gantt_for(widgets.entry_id)
+            self._draw_progress_indicator(entry_id)
+            redraw_ids.append(entry_id)
+
+        self._rendered_selected_ids = selected_ids
+        self._rendered_primary_id = self.selected_id
+        if redraw_ids:
+            self._redraw_gantt_entries(redraw_ids)
+
+    def _schedule_shortcuts_allowed(self) -> bool:
+        if self.active_mode != "schedule":
+            return False
+        try:
+            grab = self.root.grab_current()
+        except tk.TclError:
+            return False
+        if grab is not None and grab is not self.root:
+            return False
+        focus = self.root.focus_get()
+        return not isinstance(
+            focus,
+            (tk.Entry, ttk.Entry, tk.Text, tk.Spinbox, ttk.Combobox),
+        )
+
+    def _selected_clipboard_roots(self) -> list[dict]:
+        self._normalize_schedule_selection()
+        selected = self.selected_ids
+        roots = []
+        for parent in self.entries:
+            if parent["id"] in selected:
+                roots.append(copy.deepcopy(parent))
+                continue
+            roots.extend(
+                copy.deepcopy(child)
+                for child in parent.get("children", [])
+                if child["id"] in selected
+            )
+        return roots
+
+    def _on_copy_shortcut(self, _event: tk.Event | None = None) -> str | None:
+        if not self._schedule_shortcuts_allowed():
+            return None
+        roots = self._selected_clipboard_roots()
+        if not roots:
+            self._show_status("コピーする予定を選択してください。")
+            return "break"
+        self._schedule_clipboard = roots
+        if len(roots) == 1:
+            self._show_status(f"「{roots[0]['task']}」をコピーしました。")
+        else:
+            self._show_status(f"{len(roots)}件の予定をコピーしました。")
+        return "break"
+
+    def _ensure_pasted_task_width(self, entry: dict) -> None:
+        self._ensure_task_width(entry.get("task", ""), entry.get("kind", "parent"))
+        for child in entry.get("children", []):
+            self._ensure_task_width(child.get("task", ""), "child")
+
+    def _on_paste_shortcut(self, _event: tk.Event | None = None) -> str | None:
+        if not self._schedule_shortcuts_allowed():
+            return None
+        if not self._schedule_clipboard:
+            self._show_status("コピーされた予定がありません。")
+            return "break"
+        target = self._find(self.selected_id)
+        if target is None:
+            self._show_status("貼り付け先の予定を選択してください。")
+            return "break"
+
+        snapshot = self._snapshot_schedule()
+        previous_selection = self.selected_id
+        previous_selected_ids = set(self.selected_ids)
+        previous_task_column_width = self.task_column_width
+        parent_insert_index = target.parent_index + 1
+        child_parent = target.parent
+        child_insert_index = (
+            len(child_parent.get("children", []))
+            if target.is_parent
+            else int(target.child_index) + 1
+        )
+        pasted_ids = []
+        for copied in self._schedule_clipboard:
+            if copied.get("kind") == "parent":
+                cloned = clone_entry_tree(copied)
+                self.entries.insert(parent_insert_index, cloned)
+                parent_insert_index += 1
+            else:
+                cloned = clone_entry_tree(copied, child_parent["id"])
+                child_parent.setdefault("children", []).insert(
+                    child_insert_index,
+                    cloned,
+                )
+                child_insert_index += 1
+                child_parent["collapsed"] = False
+                expand_parent_to_include_child_dates(
+                    child_parent,
+                    cloned["start"],
+                    cloned["end"],
+                )
+            pasted_ids.append(cloned["id"])
+            self._ensure_pasted_task_width(cloned)
+
+        self.selected_ids = set(pasted_ids)
+        self.selected_id = pasted_ids[-1]
+        if not self._save_or_restore(snapshot):
+            self.selected_id = previous_selection
+            self.selected_ids = previous_selected_ids
+            self.task_column_width = previous_task_column_width
+            self._rebuild_rows()
+            self._show_status("貼り付けを元に戻しました。")
+            return "break"
+        self._rebuild_rows()
+        self._show_status(f"{len(pasted_ids)}件の予定を貼り付けました。")
+        return "break"
 
     # ----- button actions -----
     def _on_add_parent(self) -> None:
@@ -3213,14 +3937,19 @@ class ScheduleApp:
             return
         snapshot = self._snapshot_schedule()
         previous_selection = self.selected_id
+        previous_selected_ids = set(self.selected_ids)
         parent = location.entry
         collapsing = not parent.get("collapsed", False)
         parent["collapsed"] = collapsing
-        selected = self._find(self.selected_id)
-        if collapsing and selected is not None and selected.entry["kind"] == "child" and selected.parent["id"] == parent["id"]:
-            self.selected_id = parent["id"]
+        child_ids = {child["id"] for child in parent.get("children", [])}
+        if collapsing and self.selected_ids.intersection(child_ids):
+            self.selected_ids.difference_update(child_ids)
+            self.selected_ids.add(parent["id"])
+            if self.selected_id in child_ids:
+                self.selected_id = parent["id"]
         if not self._save_or_restore(snapshot):
             self.selected_id = previous_selection
+            self.selected_ids = previous_selected_ids
         self._rebuild_rows()
 
     def _on_export_excel(self) -> None:
@@ -3472,6 +4201,7 @@ class ScheduleApp:
     ) -> None:
         location = self._find(entry_id)
         is_edit = location is not None
+        initial_parent_location = self._find(parent_id) if kind == "child" else None
         started_is_derived = bool(
             is_edit
             and location.is_parent
@@ -3536,9 +4266,13 @@ class ScheduleApp:
             progress_value_var.set(number_text(entry.get("progress_value", 0)))
             progress_total_var.set(number_text(entry.get("progress_total", 100)))
         else:
-            today = self.current_jst_date
-            initial_start = today
-            initial_end = today
+            if initial_parent_location is not None and initial_parent_location.is_parent:
+                initial_start = initial_parent_location.entry["start"]
+                initial_end = initial_parent_location.entry["start"]
+            else:
+                today = self.current_jst_date
+                initial_start = today
+                initial_end = today
             initial_started = None
 
         form = tk.Frame(content, bg=COLOR_SURFACE)
@@ -3591,7 +4325,57 @@ class ScheduleApp:
             value=initial_end,
             background=COLOR_SURFACE,
         )
+        start_input.grid(row=1, column=0, sticky="ew", padx=(0, 8))
+        end_input.grid(row=1, column=1, sticky="ew", padx=(8, 0))
         last_changed_date = "start"
+        child_range_notice_var = tk.StringVar()
+        started_label_row = 2
+
+        if kind == "child":
+            tk.Label(
+                dates_frame,
+                textvariable=child_range_notice_var,
+                bg=COLOR_SURFACE,
+                fg=COLOR_WARNING,
+                font=self.small_font,
+                anchor="w",
+                justify="left",
+                wraplength=480,
+            ).grid(
+                row=2,
+                column=0,
+                columnspan=2,
+                sticky="ew",
+                pady=(8, 0),
+            )
+            started_label_row = 3
+
+        def refresh_child_range_notice() -> None:
+            if kind != "child":
+                return
+            current_parent = self._find(parent_id)
+            if current_parent is None or not current_parent.is_parent:
+                child_range_notice_var.set("")
+                return
+            try:
+                start_value = start_input.get_date()
+                end_value = end_input.get_date()
+            except ValueError:
+                child_range_notice_var.set("")
+                return
+            start_days, end_days = child_date_overrun_days(
+                current_parent.entry,
+                start_value,
+                end_value,
+            )
+            messages = []
+            if start_days:
+                messages.append(
+                    CHILD_START_OVERRUN_MESSAGE.format(days=start_days)
+                )
+            if end_days:
+                messages.append(CHILD_END_OVERRUN_MESSAGE.format(days=end_days))
+            child_range_notice_var.set("\n".join(messages))
 
         def start_date_changed(value: date) -> None:
             nonlocal last_changed_date
@@ -3599,9 +4383,11 @@ class ScheduleApp:
             try:
                 end_value = end_input.get_date()
             except ValueError:
+                refresh_child_range_notice()
                 return
             if value > end_value:
                 end_input.set_date(value, notify=False)
+            refresh_child_range_notice()
 
         def end_date_changed(value: date) -> None:
             nonlocal last_changed_date
@@ -3609,9 +4395,11 @@ class ScheduleApp:
             try:
                 start_value = start_input.get_date()
             except ValueError:
+                refresh_child_range_notice()
                 return
             if value < start_value:
                 start_input.set_date(value, notify=False)
+            refresh_child_range_notice()
 
         def mark_start_changed(_event: tk.Event) -> None:
             nonlocal last_changed_date
@@ -3627,8 +4415,22 @@ class ScheduleApp:
             entry.bind("<KeyPress>", mark_start_changed, add="+")
         for entry in end_input.entries:
             entry.bind("<KeyPress>", mark_end_changed, add="+")
-        start_input.grid(row=1, column=0, sticky="ew", padx=(0, 8))
-        end_input.grid(row=1, column=1, sticky="ew", padx=(8, 0))
+        date_trace_ids: list[tuple[tk.StringVar, str]] = []
+        if kind == "child":
+            for variable in (
+                start_input.year_var,
+                start_input.month_var,
+                start_input.day_var,
+                end_input.year_var,
+                end_input.month_var,
+                end_input.day_var,
+            ):
+                trace_id = variable.trace_add(
+                    "write",
+                    lambda *_args: refresh_child_range_notice(),
+                )
+                date_trace_ids.append((variable, trace_id))
+        refresh_child_range_notice()
         tk.Label(
             dates_frame,
             text=(
@@ -3640,14 +4442,25 @@ class ScheduleApp:
             fg=COLOR_TEXT_MUTED,
             font=self.header_font,
             anchor="w",
-        ).grid(row=2, column=0, columnspan=2, sticky="ew", pady=(12, 6))
+        ).grid(
+            row=started_label_row,
+            column=0,
+            columnspan=2,
+            sticky="ew",
+            pady=(12, 6),
+        )
         started_input = DateInput(
             dates_frame,
             value=initial_started,
             allow_empty=True,
             background=COLOR_SURFACE,
         )
-        started_input.grid(row=3, column=0, columnspan=2, sticky="ew")
+        started_input.grid(
+            row=started_label_row + 1,
+            column=0,
+            columnspan=2,
+            sticky="ew",
+        )
         started_input.set_enabled(not started_is_derived)
 
         tk.Label(
@@ -3732,6 +4545,11 @@ class ScheduleApp:
                 progress_mode_var.trace_remove("write", progress_trace_id)
             except tk.TclError:
                 pass
+            for variable, trace_id in date_trace_ids:
+                try:
+                    variable.trace_remove("write", trace_id)
+                except tk.TclError:
+                    pass
             if dlg.grab_current() == dlg:
                 dlg.grab_release()
             dlg.destroy()
@@ -3785,16 +4603,6 @@ class ScheduleApp:
                 if parent_location is None or not parent_location.is_parent:
                     messagebox.showerror(ERROR_INPUT_TITLE, WARNING_SELECT_PARENT_MESSAGE)
                     return
-                if not child_dates_within_parent(
-                    parent_location.entry,
-                    start_value,
-                    end_value,
-                ):
-                    messagebox.showerror(
-                        ERROR_INPUT_TITLE,
-                        ERROR_CHILD_OUTSIDE_PARENT,
-                    )
-                    return
             try:
                 progress_value = float(progress_value_var.get().strip())
                 progress_total = 100.0 if progress_mode_var.get() == "percent" else float(progress_total_var.get().strip())
@@ -3821,6 +4629,7 @@ class ScheduleApp:
                 )
             snapshot = self._snapshot_schedule()
             previous_selection = self.selected_id
+            previous_selected_ids = set(self.selected_ids)
             if is_edit:
                 current_location = self._find(entry_id)
                 if current_location is None:
@@ -3841,6 +4650,7 @@ class ScheduleApp:
                 if current_location.is_parent:
                     clamp_children_to_parent(target)
                 self.selected_id = target["id"]
+                self.selected_ids.add(target["id"])
             else:
                 target = new_entry(
                     task=task_text,
@@ -3859,10 +4669,19 @@ class ScheduleApp:
                     parent_location.entry.setdefault("children", []).append(target)
                     parent_location.entry["collapsed"] = False
                 self.selected_id = target["id"]
+                self.selected_ids = {target["id"]}
+
+            if kind == "child":
+                expand_parent_to_include_child_dates(
+                    parent_location.entry,
+                    start_value,
+                    end_value,
+                )
 
             self._ensure_task_width(task_text, kind)
             if not self._save_or_restore(snapshot):
                 self.selected_id = previous_selection
+                self.selected_ids = previous_selected_ids
                 self._rebuild_rows()
                 return
             self._rebuild_rows()
@@ -3927,13 +4746,51 @@ class ScheduleApp:
             max(entry["end"] for entry in visible_entries),
         )
 
+    def _timeline_range(self) -> tuple[date | None, date | None]:
+        start, end = self._visible_range()
+        if start is None or end is None:
+            return None, None
+        start_ordinal = max(1, start.toordinal() - GANTT_RANGE_PADDING_DAYS)
+        end_ordinal = min(
+            date.max.toordinal(),
+            end.toordinal() + GANTT_RANGE_PADDING_DAYS,
+        )
+        return date.fromordinal(start_ordinal), date.fromordinal(end_ordinal)
+
+    def _gantt_geometry(
+        self,
+        width: int,
+        timeline_range: tuple[date | None, date | None] | None = None,
+    ) -> tuple[date, date, int, float, float, float] | None:
+        start, end = self._timeline_range() if timeline_range is None else timeline_range
+        if start is None or end is None:
+            return None
+        visible_days = max(1, (end - start).days + 1)
+        padding = 4.0
+        usable_width = max(1.0, width - 2 * padding)
+        return (
+            start,
+            end,
+            visible_days,
+            padding,
+            usable_width,
+            usable_width / visible_days,
+        )
+
+    def _displayed_gantt_range(self, entry: dict) -> tuple[date, date]:
+        state = getattr(self, "_gantt_drag", None)
+        if state is not None and state.active and entry["id"] in state.preview_ranges:
+            return state.preview_ranges[entry["id"]]
+        return entry["start"], entry["end"]
+
     def _refresh_delay_labels(self) -> None:
         for widgets in self.row_widgets:
-            location = self._find(widgets.entry_id)
-            if location is None:
+            row_entry = self._row_entry_for(widgets.entry_id)
+            if row_entry is None:
                 continue
-            days = self._delay_days(location.entry)
-            is_selected = widgets.entry_id == self.selected_id
+            entry, _parent = row_entry
+            days = self._delay_days(entry)
+            is_selected = self._is_selected(widgets.entry_id)
             widgets.delay_label.configure(
                 text=f"{days}日遅延" if days else "—",
                 fg=COLOR_DANGER if days else COLOR_TEXT_MUTED,
@@ -3947,31 +4804,43 @@ class ScheduleApp:
             )
 
     def _redraw_all_gantt(self) -> None:
-        for widgets in self.row_widgets:
-            self._redraw_gantt_for(widgets.entry_id)
+        self._redraw_gantt_entries(
+            widgets.entry_id
+            for widgets in self.row_widgets
+        )
 
-    def _redraw_gantt_for(self, entry_id: str) -> None:
-        widgets = next((item for item in self.row_widgets if item.entry_id == entry_id), None)
-        location = self._find(entry_id)
-        if widgets is None or location is None:
+    def _redraw_gantt_entries(self, entry_ids) -> None:
+        timeline_range = self._timeline_range()
+        self._render_timeline_range = timeline_range
+        for entry_id in dict.fromkeys(entry_ids):
+            self._redraw_gantt_for(entry_id, timeline_range=timeline_range)
+
+    def _redraw_gantt_for(
+        self,
+        entry_id: str,
+        *,
+        timeline_range: tuple[date | None, date | None] | None = None,
+    ) -> None:
+        widgets = self._row_widgets_for(entry_id)
+        row_entry = self._row_entry_for(entry_id)
+        if widgets is None or row_entry is None:
             return
         canvas = widgets.gantt_canvas
         canvas.delete("all")
+        widgets.gantt_bounds = None
 
-        entry = location.entry
-        parent = location.parent
+        entry, parent = row_entry
         width = canvas.winfo_width()
         height = canvas.winfo_height()
         if width <= 4 or height <= 4:
             return
 
-        start_all, end_all = self._visible_range()
-        if start_all is None or end_all is None:
+        if timeline_range is None:
+            timeline_range = getattr(self, "_render_timeline_range", None)
+        geometry = self._gantt_geometry(width, timeline_range)
+        if geometry is None:
             return
-        vis_days = max(1, (end_all - start_all).days + 1)
-        pad = 4
-        usable_w = max(1, width - 2 * pad)
-        pixels_per_day = usable_w / vis_days
+        start_all, end_all, vis_days, pad, usable_w, pixels_per_day = geometry
 
         def x_for(index_value: int | float) -> float:
             return pad + usable_w * (index_value / vis_days)
@@ -3985,7 +4854,7 @@ class ScheduleApp:
             )
             weekend_color = (
                 COLOR_SELECTED_WEEKEND
-                if widgets.entry_id == self.selected_id
+                if self._is_selected(widgets.entry_id)
                 else COLOR_WEEKEND
             )
             while weekend is not None and weekend <= end_all:
@@ -4020,32 +4889,57 @@ class ScheduleApp:
             )
 
         if self._effective_visible(entry, parent):
-            start_index = max(0, min(vis_days, (entry["start"] - start_all).days))
-            span_days = (entry["end"] - entry["start"]).days + 1
-            end_index = max(0, min(vis_days, start_index + span_days))
+            displayed_start, displayed_end = self._displayed_gantt_range(entry)
+            start_index = max(0, min(vis_days, (displayed_start - start_all).days))
+            span_days = (displayed_end - displayed_start).days + 1
+            end_index = max(
+                0,
+                min(vis_days, (displayed_end - start_all).days + 1),
+            )
             x0 = x_for(start_index)
             x1 = x_for(end_index)
             if x1 <= x0:
                 x1 = min(width - pad, x0 + 1)
             is_parent = entry["kind"] == "parent"
-            y0, y1 = (9, height - 9) if is_parent else (12, height - 12)
-            remaining_color = COLOR_PARENT_REMAINING if is_parent else COLOR_CHILD_REMAINING
-            completed_color = COLOR_PARENT_COMPLETE if is_parent else COLOR_CHILD_COMPLETE
+            line_height = self.small_font.metrics("linespace")
+            height_ratio = 0.68 if is_parent else 0.58
+            vertical_margin = 4 if is_parent else 6
+            minimum_height = line_height + (8 if is_parent else 5)
+            bar_height = min(
+                height - vertical_margin,
+                max(minimum_height, round(height * height_ratio)),
+            )
+            y0 = (height - bar_height) / 2
+            y1 = y0 + bar_height
+            radius = min(7, bar_height / 2)
+            has_children = bool(entry.get("children")) if is_parent else False
+            if is_parent and not has_children:
+                remaining_color = COLOR_PARENT_WITHOUT_CHILDREN_REMAINING
+                completed_color = COLOR_PARENT_WITHOUT_CHILDREN_COMPLETE
+            else:
+                remaining_color = (
+                    COLOR_PARENT_REMAINING if is_parent else COLOR_CHILD_REMAINING
+                )
+                completed_color = (
+                    COLOR_PARENT_COMPLETE if is_parent else COLOR_CHILD_COMPLETE
+                )
             create_rounded_rectangle(
                 canvas,
                 x0,
                 y0,
                 x1,
                 y1,
-                7,
+                radius,
                 fill=remaining_color,
                 outline=(
                     COLOR_PRIMARY
-                    if widgets.entry_id == self.selected_id
+                    if self._is_selected(widgets.entry_id)
                     else completed_color
                 ),
-                width=2 if widgets.entry_id == self.selected_id else 1,
+                width=2 if self._is_selected(widgets.entry_id) else 1,
+                tags=("gantt_bar",),
             )
+            widgets.gantt_bounds = (x0, y0, x1, y1)
             progress_x = x0 + (x1 - x0) * progress_ratio(entry)
             if progress_x > x0:
                 create_rounded_rectangle(
@@ -4054,24 +4948,44 @@ class ScheduleApp:
                     y0,
                     progress_x,
                     y1,
-                    7,
+                    radius,
                     fill=completed_color,
                     outline="",
+                    tags=("gantt_bar",),
                 )
             bar_width = x1 - x0
-            if bar_width >= 36:
-                label = (
-                    f"{span_days}日  •  {progress_text(entry)}"
-                    if bar_width >= 90
-                    else f"{progress_ratio(entry):.0%}"
-                )
+            label = f"{span_days}日・{progress_ratio(entry):.0%}"
+            label_width = self.small_font.measure(label)
+            if label_width + 12 <= bar_width and bar_height >= line_height + 2:
+                label_x = (x0 + x1) / 2
+                label_anchor = "center"
                 label_color = "white" if progress_ratio(entry) >= 0.55 else COLOR_TEXT
+            else:
+                label_gap = 5
+                right_space = width - pad - x1 - label_gap
+                left_space = x0 - pad - label_gap
+                if right_space >= label_width or right_space >= left_space:
+                    label_x = max(
+                        pad,
+                        min(x1 + label_gap, width - pad - label_width),
+                    )
+                    label_anchor = "w"
+                else:
+                    label_x = min(
+                        width - pad,
+                        max(x0 - label_gap, pad + label_width),
+                    )
+                    label_anchor = "e"
+                label_color = COLOR_TEXT
+            if bar_height >= line_height + 2:
                 canvas.create_text(
-                    (x0 + x1) / 2,
+                    label_x,
                     (y0 + y1) / 2,
                     text=label,
                     fill=label_color,
                     font=self.small_font,
+                    anchor=label_anchor,
+                    tags=("gantt_label",),
                 )
 
         if x_today is not None:
@@ -4086,15 +5000,14 @@ class ScheduleApp:
         width = canvas.winfo_width()
         height = canvas.winfo_height()
         if width <= 4 or height <= 4:
-            canvas.after(40, self._redraw_scale)
+            self._schedule_after(40, self._redraw_scale)
             return
-        start_all, end_all = self._visible_range()
-        if start_all is None or end_all is None:
+        timeline_range = self._timeline_range()
+        self._render_timeline_range = timeline_range
+        geometry = self._gantt_geometry(width, timeline_range)
+        if geometry is None:
             return
-        vis_days = max(1, (end_all - start_all).days + 1)
-        pad = 4
-        usable_w = max(1, width - 2 * pad)
-        pixels_per_day = usable_w / vis_days
+        start_all, end_all, vis_days, pad, usable_w, pixels_per_day = geometry
 
         def x_for(index_value: int | float) -> float:
             return pad + usable_w * (index_value / vis_days)
@@ -4246,7 +5159,6 @@ class ScheduleApp:
                 font=self.small_font,
             )
         canvas.create_line(pad, height - 1, width - pad, height - 1, fill=COLOR_BORDER)
-        self._redraw_all_gantt()
 
 
 def main() -> None:

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import copy
 import gc
+from datetime import timedelta
 import tkinter as tk
 from tkinter import ttk
 from types import SimpleNamespace
@@ -23,6 +25,7 @@ class ScheduleAppTkTests(unittest.TestCase):
         self.addCleanup(self.load_patcher.stop)
 
         self.app = app_module.ScheduleApp(self.root)
+        self.addCleanup(self._cancel_scheduled_callbacks)
         self.root.geometry("1280x720+20+20")
         parent = new_entry(
             KIND_PARENT,
@@ -1137,8 +1140,19 @@ class ScheduleAppTkTests(unittest.TestCase):
         )
         self.assertFalse(dialog.winfo_exists())
 
-    def test_child_creation_rejects_dates_outside_parent_period(self) -> None:
-        self.app._open_entry_dialog(kind="child", parent_id=self.parent["id"])
+    def test_child_creation_defaults_to_parent_start_and_expands_parent(self) -> None:
+        parent = new_entry(
+            KIND_PARENT,
+            "親タスク",
+            "2026-08-22",
+            "2026-08-24",
+            entry_id="parent-overrun",
+        )
+        self.app.schedule["parents"] = [parent]
+        self.app._ensure_schedule_defaults()
+        self.app._rebuild_rows()
+
+        self.app._open_entry_dialog(kind="child", parent_id=parent["id"])
         self._pump()
         dialog = next(
             widget
@@ -1152,30 +1166,58 @@ class ScheduleAppTkTests(unittest.TestCase):
             dialog,
             app_module.DateInput,
         )[:2]
-        start_input.set_date(app_module.date(2026, 6, 30))
-        end_input.set_date(app_module.date(2026, 7, 1))
+        notice = next(
+            label
+            for label in self._descendants_of_type(dialog, tk.Label)
+            if label.cget("fg") == app_module.COLOR_WARNING
+        )
+        self.assertEqual(start_input.get_date(), app_module.date(2026, 8, 22))
+        self.assertEqual(end_input.get_date(), app_module.date(2026, 8, 22))
+        self.assertEqual(notice.cget("text"), "")
+
+        start_input.set_date(app_module.date(2026, 8, 21))
+        self.assertEqual(
+            notice.cget("text"),
+            "親スケジュールの開始日より前に1日はみ出しています。",
+        )
+        end_input.set_date(app_module.date(2026, 8, 25))
+        self.assertEqual(
+            notice.cget("text"),
+            "親スケジュールの開始日より前に1日はみ出しています。\n"
+            "親スケジュールの終了日より後に1日はみ出しています。",
+        )
+
+        start_input.day_entry.delete(0, "end")
+        start_input.day_entry.event_generate("<KeyRelease>")
+        self._pump()
+        self.assertEqual(notice.cget("text"), "")
+        start_input.set_date(app_module.date(2026, 8, 21))
+
         save_button = next(
             button
             for button in self._descendants_of_type(dialog, ttk.Button)
             if button.cget("style") == "Primary.TButton"
         )
-        child_count = len(self.parent["children"])
         self.app._save.reset_mock()
 
         with patch.object(app_module.messagebox, "showerror") as showerror:
             save_button.invoke()
             self._pump()
 
-        showerror.assert_called_once_with(
-            app_module.ERROR_INPUT_TITLE,
-            app_module.ERROR_CHILD_OUTSIDE_PARENT,
+        showerror.assert_not_called()
+        self.app._save.assert_called_once_with()
+        self.assertEqual(
+            (parent["start"], parent["end"]),
+            (app_module.date(2026, 8, 21), app_module.date(2026, 8, 25)),
         )
-        self.assertEqual(len(self.parent["children"]), child_count)
-        self.app._save.assert_not_called()
-        self.assertTrue(dialog.winfo_exists())
+        self.assertEqual(len(parent["children"]), 1)
+        self.assertEqual(
+            (parent["children"][0]["start"], parent["children"][0]["end"]),
+            (app_module.date(2026, 8, 21), app_module.date(2026, 8, 25)),
+        )
+        self.assertFalse(dialog.winfo_exists())
 
-    def test_child_edit_rejects_dates_outside_parent_period(self) -> None:
-        original_dates = (self.child_a["start"], self.child_a["end"])
+    def test_child_edit_shows_live_overrun_and_expands_parent(self) -> None:
         self.app._on_edit(self.child_a["id"])
         self._pump()
         dialog = next(
@@ -1187,8 +1229,30 @@ class ScheduleAppTkTests(unittest.TestCase):
             dialog,
             app_module.DateInput,
         )[:2]
-        start_input.set_date(app_module.date(2026, 7, 25))
+        notice = next(
+            label
+            for label in self._descendants_of_type(dialog, tk.Label)
+            if label.cget("fg") == app_module.COLOR_WARNING
+        )
+
+        start_input.set_date(app_module.date(2026, 6, 30))
+        self.assertEqual(
+            notice.cget("text"),
+            "親スケジュールの開始日より前に1日はみ出しています。",
+        )
+        start_input.set_date(app_module.date(2026, 7, 1))
+        self.assertEqual(notice.cget("text"), "")
         end_input.set_date(app_module.date(2026, 8, 1))
+        self.assertEqual(
+            notice.cget("text"),
+            "親スケジュールの終了日より後に1日はみ出しています。",
+        )
+        start_input.set_date(app_module.date(2026, 6, 30))
+        self.assertEqual(
+            notice.cget("text"),
+            "親スケジュールの開始日より前に1日はみ出しています。\n"
+            "親スケジュールの終了日より後に1日はみ出しています。",
+        )
         save_button = next(
             button
             for button in self._descendants_of_type(dialog, ttk.Button)
@@ -1200,12 +1264,90 @@ class ScheduleAppTkTests(unittest.TestCase):
             save_button.invoke()
             self._pump()
 
-        showerror.assert_called_once_with(
-            app_module.ERROR_INPUT_TITLE,
-            app_module.ERROR_CHILD_OUTSIDE_PARENT,
+        showerror.assert_not_called()
+        self.app._save.assert_called_once_with()
+        self.assertEqual(
+            (self.child_a["start"], self.child_a["end"]),
+            (app_module.date(2026, 6, 30), app_module.date(2026, 8, 1)),
         )
-        self.assertEqual((self.child_a["start"], self.child_a["end"]), original_dates)
-        self.app._save.assert_not_called()
+        self.assertEqual(
+            (self.parent["start"], self.parent["end"]),
+            (app_module.date(2026, 6, 30), app_module.date(2026, 8, 1)),
+        )
+        self.assertFalse(dialog.winfo_exists())
+
+    def test_child_creation_rolls_back_parent_expansion_when_save_fails(self) -> None:
+        original_child_ids = [child["id"] for child in self.parent["children"]]
+        self.app._open_entry_dialog(kind="child", parent_id=self.parent["id"])
+        self._pump()
+        dialog = next(
+            widget
+            for widget in self.root.winfo_children()
+            if isinstance(widget, tk.Toplevel)
+        )
+        all_entries = self._descendants_of_type(dialog, ttk.Entry)
+        all_entries[0].insert(0, "保存失敗する子")
+        start_input, end_input = self._descendants_of_type(
+            dialog,
+            app_module.DateInput,
+        )[:2]
+        start_input.set_date(app_module.date(2026, 6, 30))
+        end_input.set_date(app_module.date(2026, 8, 1))
+        save_button = next(
+            button
+            for button in self._descendants_of_type(dialog, ttk.Button)
+            if button.cget("style") == "Primary.TButton"
+        )
+        self.app._save = Mock(return_value=False)
+
+        save_button.invoke()
+        self._pump()
+
+        restored_parent = self.app.schedule["parents"][0]
+        self.assertEqual(
+            (restored_parent["start"], restored_parent["end"]),
+            (app_module.date(2026, 7, 1), app_module.date(2026, 7, 31)),
+        )
+        self.assertEqual(
+            [child["id"] for child in restored_parent["children"]],
+            original_child_ids,
+        )
+        self.assertTrue(dialog.winfo_exists())
+
+    def test_child_edit_rolls_back_parent_expansion_when_save_fails(self) -> None:
+        self.app._on_edit(self.child_a["id"])
+        self._pump()
+        dialog = next(
+            widget
+            for widget in self.root.winfo_children()
+            if isinstance(widget, tk.Toplevel)
+        )
+        start_input, end_input = self._descendants_of_type(
+            dialog,
+            app_module.DateInput,
+        )[:2]
+        start_input.set_date(app_module.date(2026, 6, 30))
+        end_input.set_date(app_module.date(2026, 8, 1))
+        save_button = next(
+            button
+            for button in self._descendants_of_type(dialog, ttk.Button)
+            if button.cget("style") == "Primary.TButton"
+        )
+        self.app._save = Mock(return_value=False)
+
+        save_button.invoke()
+        self._pump()
+
+        restored_parent = self.app.schedule["parents"][0]
+        restored_child = restored_parent["children"][0]
+        self.assertEqual(
+            (restored_parent["start"], restored_parent["end"]),
+            (app_module.date(2026, 7, 1), app_module.date(2026, 7, 31)),
+        )
+        self.assertEqual(
+            (restored_child["start"], restored_child["end"]),
+            (app_module.date(2026, 7, 2), app_module.date(2026, 7, 12)),
+        )
         self.assertTrue(dialog.winfo_exists())
 
     def test_repeated_dialog_close_does_not_leak_trace_commands(self) -> None:
@@ -1347,6 +1489,628 @@ class ScheduleAppTkTests(unittest.TestCase):
         self.assertTrue(self.app.todo_header.winfo_ismapped())
         self.assertFalse(self.app.header.winfo_ismapped())
 
+    def test_schedule_multiselect_copy_feedback_and_shortcut_guards(self) -> None:
+        self.app._select_from_event(self.parent["id"], SimpleNamespace(state=0))
+        self.app._select_from_event(
+            self.child_a["id"],
+            SimpleNamespace(state=app_module.CONTROL_STATE_MASK),
+        )
+        self.assertEqual(
+            self.app.selected_ids,
+            {self.parent["id"], self.child_a["id"]},
+        )
+        self.assertEqual(self.app.selected_id, self.child_a["id"])
+
+        self.assertEqual(self.app._on_copy_shortcut(), "break")
+        self.assertEqual(len(self.app._schedule_clipboard), 1)
+        self.assertEqual(self.app._schedule_clipboard[0]["id"], self.parent["id"])
+        self.assertEqual(
+            self.app.status_label.cget("text"),
+            f"「{self.parent['task']}」をコピーしました。",
+        )
+        copied_task = self.app._schedule_clipboard[0]["task"]
+        self.parent["task"] = "コピー後に変更"
+        self.assertEqual(self.app._schedule_clipboard[0]["task"], copied_task)
+
+        self.app._select_from_event(
+            self.child_a["id"],
+            SimpleNamespace(state=app_module.CONTROL_STATE_MASK),
+        )
+        self.assertEqual(self.app.selected_ids, {self.parent["id"]})
+        clipboard_before = copy.deepcopy(self.app._schedule_clipboard)
+        self.app._switch_mode("todo")
+        self.assertIsNone(self.app._on_copy_shortcut())
+        self.assertEqual(self.app._schedule_clipboard, clipboard_before)
+
+        self.app._switch_mode("schedule")
+        text_input = ttk.Entry(self.root)
+        text_input.grid(row=99, column=0)
+        text_input.focus_force()
+        self._pump()
+        self.assertIsNone(self.app._on_paste_shortcut())
+        text_input.destroy()
+
+    def test_schedule_paste_keeps_tree_fields_positions_and_rolls_back(self) -> None:
+        self.parent["custom_parent_field"] = {"theme": "blue"}
+        self.child_a["custom_child_field"] = ["保持", 1]
+        self.app._select(self.parent["id"])
+        self.app._on_copy_shortcut()
+        self.app._select(self.child_a["id"])
+        self.app._save.reset_mock()
+
+        self.assertEqual(self.app._on_paste_shortcut(), "break")
+        self.assertEqual(len(self.app.entries), 2)
+        pasted_parent = self.app.entries[1]
+        self.assertEqual(pasted_parent["task"], self.parent["task"])
+        self.assertNotEqual(pasted_parent["id"], self.parent["id"])
+        self.assertEqual(pasted_parent["custom_parent_field"], {"theme": "blue"})
+        self.assertEqual(len(pasted_parent["children"]), 2)
+        self.assertTrue(
+            all(
+                child["parent_id"] == pasted_parent["id"]
+                and child["id"] not in {self.child_a["id"], self.child_b["id"]}
+                for child in pasted_parent["children"]
+            )
+        )
+        self.app._save.assert_called_once_with()
+
+        self.app._select(self.child_a["id"])
+        self.app._on_copy_shortcut()
+        self.app._schedule_clipboard[0]["start"] = self.parent["start"] - timedelta(days=2)
+        self.app._schedule_clipboard[0]["end"] = self.parent["end"] + timedelta(days=3)
+        self.app._select(self.child_b["id"])
+        self.parent["collapsed"] = True
+        self.app._save.reset_mock()
+        self.app._on_paste_shortcut()
+
+        pasted_child = self.parent["children"][2]
+        self.assertEqual(pasted_child["task"], self.child_a["task"])
+        self.assertNotEqual(pasted_child["id"], self.child_a["id"])
+        self.assertEqual(pasted_child["parent_id"], self.parent["id"])
+        self.assertEqual(pasted_child["custom_child_field"], ["保持", 1])
+        self.assertFalse(self.parent["collapsed"])
+        self.assertEqual(self.parent["start"], pasted_child["start"])
+        self.assertEqual(self.parent["end"], pasted_child["end"])
+
+        self.app._select(self.child_a["id"])
+        self.app._on_copy_shortcut()
+        self.app._schedule_clipboard[0]["task"] = "非常に長い予定名" * 30
+        self.app._select(self.parent["id"])
+        self.app._select(self.child_b["id"], additive=True)
+        schedule_before = copy.deepcopy(self.app.schedule)
+        selected_before = set(self.app.selected_ids)
+        primary_before = self.app.selected_id
+        task_width_before = self.app.task_column_width
+        self.app._save = Mock(return_value=False)
+
+        self.app._on_paste_shortcut()
+
+        self.assertEqual(self.app.schedule, schedule_before)
+        self.assertEqual(self.app.selected_ids, selected_before)
+        self.assertEqual(self.app.selected_id, primary_before)
+        self.assertEqual(self.app.task_column_width, task_width_before)
+        self.assertEqual(self.app.status_label.cget("text"), "貼り付けを元に戻しました。")
+
+    def test_schedule_mixed_paste_preserves_source_order_by_kind(self) -> None:
+        second_parent = new_entry(
+            KIND_PARENT,
+            "2番目の親",
+            "2026-08-01",
+            "2026-08-05",
+            entry_id="parent-2",
+        )
+        second_child = new_entry(
+            KIND_CHILD,
+            "2番目の子",
+            "2026-08-02",
+            "2026-08-03",
+            parent_id=second_parent["id"],
+            entry_id="child-c",
+        )
+        second_parent["children"].append(second_child)
+        self.app.entries.append(second_parent)
+        self.app._rebuild_rows()
+        self._pump()
+
+        self.app._select(self.child_a["id"])
+        self.app._select(second_parent["id"], additive=True)
+        self.app._on_copy_shortcut()
+        self.assertEqual(
+            [entry["task"] for entry in self.app._schedule_clipboard],
+            [self.child_a["task"], second_parent["task"]],
+        )
+        self.app._select(self.child_b["id"])
+        self.app._on_paste_shortcut()
+
+        pasted_child = self.parent["children"][2]
+        pasted_parent = self.app.entries[1]
+        self.assertEqual(pasted_child["task"], self.child_a["task"])
+        self.assertEqual(pasted_parent["task"], second_parent["task"])
+        self.assertEqual(self.app.entries[2]["id"], second_parent["id"])
+        self.assertNotEqual(pasted_child["id"], self.child_a["id"])
+        self.assertNotEqual(pasted_parent["id"], second_parent["id"])
+        self.assertEqual(
+            self.app.selected_ids,
+            {pasted_child["id"], pasted_parent["id"]},
+        )
+        self.assertEqual(self.app.status_label.cget("text"), "2件の予定を貼り付けました。")
+
+    def test_gantt_double_click_hit_testing_and_cursor(self) -> None:
+        row = self.app.row_widgets[1]
+        self.assertIsNotNone(row.gantt_bounds)
+        x0, y0, x1, y1 = row.gantt_bounds
+        center = SimpleNamespace(x=(x0 + x1) / 2, y=(y0 + y1) / 2)
+        background = SimpleNamespace(x=(x0 + x1) / 2, y=0)
+        with patch.object(self.app, "_on_edit") as edit:
+            self.app._on_gantt_double_click(self.child_a["id"], background)
+            edit.assert_not_called()
+            self.app._on_gantt_double_click(self.child_a["id"], center)
+            edit.assert_called_once_with(self.child_a["id"])
+        self.assertEqual(self.app.selected_ids, {self.child_a["id"]})
+
+        self.app._on_gantt_hover(
+            self.child_a["id"],
+            SimpleNamespace(x=x0 + 1, y=(y0 + y1) / 2),
+        )
+        self.assertEqual(row.gantt_canvas.cget("cursor"), "sb_h_double_arrow")
+        self.app._on_gantt_hover(self.child_a["id"], center)
+        self.assertEqual(row.gantt_canvas.cget("cursor"), "fleur")
+        self.app._on_gantt_hover(self.child_a["id"], background)
+        self.assertEqual(row.gantt_canvas.cget("cursor"), "arrow")
+
+    def test_one_day_gantt_bar_body_moves_and_outer_edges_resize(self) -> None:
+        standalone = new_entry(
+            KIND_PARENT,
+            "1日の予定",
+            "2026-07-25",
+            "2026-07-25",
+            entry_id="one-day-parent",
+        )
+        self.app.entries.append(standalone)
+        self.app._rebuild_rows()
+        self._pump()
+
+        row = self.app._row_widgets_for(standalone["id"])
+        self.assertIsNotNone(row)
+        x0, y0, x1, y1 = row.gantt_bounds
+        y = (y0 + y1) / 2
+        self.assertLessEqual(x1 - x0, app_module.GANTT_EDGE_HIT_PX * 2)
+        self.assertEqual(
+            self.app._gantt_hit_operation(row, (x0 + x1) / 2, y),
+            "move",
+        )
+        self.assertEqual(
+            self.app._gantt_hit_operation(row, x0 - 2, y),
+            "resize_start",
+        )
+        self.assertEqual(
+            self.app._gantt_hit_operation(row, x1 + 2, y),
+            "resize_end",
+        )
+
+        original_start = standalone["start"]
+        original_end = standalone["end"]
+        self.app._on_gantt_press(
+            standalone["id"],
+            SimpleNamespace(
+                x=(x0 + x1) / 2,
+                y=y,
+                x_root=500,
+                state=0,
+            ),
+        )
+        pixels_per_day = self.app._gantt_drag.pixels_per_day
+        self.assertEqual(self.app._gantt_drag.operation, "move")
+        self.app._on_gantt_motion(
+            standalone["id"],
+            SimpleNamespace(x_root=500 + pixels_per_day * 2),
+        )
+        self.app._on_gantt_release(standalone["id"], SimpleNamespace())
+
+        self.assertEqual(standalone["start"], original_start + timedelta(days=2))
+        self.assertEqual(standalone["end"], original_end + timedelta(days=2))
+        self.assertEqual(standalone["end"] - standalone["start"], timedelta(0))
+
+    def test_gantt_move_previews_then_moves_selected_parent_tree_once(self) -> None:
+        unrelated = new_entry(
+            KIND_PARENT,
+            "移動対象外",
+            "2026-07-08",
+            "2026-07-10",
+            entry_id="unrelated-parent",
+        )
+        self.app.entries.append(unrelated)
+        self.app._rebuild_rows()
+        self._pump()
+        original_ranges = {
+            entry["id"]: (entry["start"], entry["end"])
+            for entry in (self.parent, self.child_a, self.child_b)
+        }
+        self.app._select(self.parent["id"])
+        self.app._select(self.child_a["id"], additive=True)
+        row = self.app.row_widgets[0]
+        x0, y0, x1, y1 = row.gantt_bounds
+        press = SimpleNamespace(
+            x=(x0 + x1) / 2,
+            y=(y0 + y1) / 2,
+            x_root=500,
+            state=0,
+        )
+        self.app._save.reset_mock()
+        self.app._on_gantt_press(self.parent["id"], press)
+        pixels_per_day = self.app._gantt_drag.pixels_per_day
+        with patch.object(
+            self.app,
+            "_redraw_gantt_for",
+            wraps=self.app._redraw_gantt_for,
+        ) as redraw:
+            self.app._on_gantt_motion(
+                self.parent["id"],
+                SimpleNamespace(x_root=500 + pixels_per_day * 2),
+            )
+
+        self.assertEqual(
+            {item.args[0] for item in redraw.call_args_list},
+            {self.parent["id"], self.child_a["id"], self.child_b["id"]},
+        )
+        self.assertNotIn(unrelated["id"], {item.args[0] for item in redraw.call_args_list})
+
+        self.assertTrue(self.app._gantt_drag.active)
+        self.assertEqual(self.app._gantt_drag.root_entry_ids, (self.parent["id"],))
+        self.assertEqual(
+            self.app._gantt_drag.preview_ranges[self.parent["id"]][0],
+            original_ranges[self.parent["id"]][0] + timedelta(days=2),
+        )
+        for entry in (self.parent, self.child_a, self.child_b):
+            self.assertEqual(
+                (entry["start"], entry["end"]),
+                original_ranges[entry["id"]],
+            )
+
+        row_containers = tuple(row.container for row in self.app.row_widgets)
+        with patch.object(self.app, "_rebuild_rows") as rebuild:
+            self.app._on_gantt_release(self.parent["id"], SimpleNamespace())
+        rebuild.assert_not_called()
+        self._pump()
+        self.assertEqual(
+            tuple(row.container for row in self.app.row_widgets),
+            row_containers,
+        )
+        for entry in (self.parent, self.child_a, self.child_b):
+            self.assertEqual(
+                (entry["start"], entry["end"]),
+                tuple(value + timedelta(days=2) for value in original_ranges[entry["id"]]),
+            )
+        self.app._save.assert_called_once_with()
+
+        after_move = copy.deepcopy(self.app.schedule)
+        self.app._select(self.parent["id"])
+        row = self.app.row_widgets[0]
+        x0, y0, x1, y1 = row.gantt_bounds
+        self.app._on_gantt_press(
+            self.parent["id"],
+            SimpleNamespace(
+                x=(x0 + x1) / 2,
+                y=(y0 + y1) / 2,
+                x_root=600,
+                state=0,
+            ),
+        )
+        pixels_per_day = self.app._gantt_drag.pixels_per_day
+        self.app._on_gantt_motion(
+            self.parent["id"],
+            SimpleNamespace(x_root=600 - pixels_per_day * 3),
+        )
+        self.assertEqual(self.app._on_row_drag_escape(), "break")
+        self.assertEqual(self.app.schedule, after_move)
+        self.assertIsNone(self.app._gantt_drag)
+
+    def test_gantt_zero_drop_and_multiple_child_move(self) -> None:
+        self.app._select(self.parent["id"])
+        self.app._select(self.child_a["id"], additive=True)
+        parent_row = self.app.row_widgets[0]
+        x0, y0, x1, y1 = parent_row.gantt_bounds
+        self.app._save.reset_mock()
+        self.app._on_gantt_press(
+            self.parent["id"],
+            SimpleNamespace(
+                x=(x0 + x1) / 2,
+                y=(y0 + y1) / 2,
+                x_root=500,
+                state=0,
+            ),
+        )
+        self.app._on_gantt_release(self.parent["id"], SimpleNamespace())
+        self.assertEqual(self.app.selected_ids, {self.parent["id"]})
+        self.app._save.assert_not_called()
+
+        original_parent_start = self.parent["start"]
+        original_ranges = {
+            child["id"]: (child["start"], child["end"], child["started"])
+            for child in (self.child_a, self.child_b)
+        }
+        self.app._select(self.child_a["id"])
+        self.app._select(self.child_b["id"], additive=True)
+        child_row = self.app.row_widgets[2]
+        x0, y0, x1, y1 = child_row.gantt_bounds
+        self.app._on_gantt_press(
+            self.child_b["id"],
+            SimpleNamespace(
+                x=(x0 + x1) / 2,
+                y=(y0 + y1) / 2,
+                x_root=700,
+                state=0,
+            ),
+        )
+        pixels_per_day = self.app._gantt_drag.pixels_per_day
+        self.app._on_gantt_motion(
+            self.child_b["id"],
+            SimpleNamespace(x_root=700 + pixels_per_day * 10),
+        )
+        self.app._on_gantt_release(self.child_b["id"], SimpleNamespace())
+        self._pump()
+
+        for child in (self.child_a, self.child_b):
+            old_start, old_end, old_started = original_ranges[child["id"]]
+            self.assertEqual(child["start"], old_start + timedelta(days=10))
+            self.assertEqual(child["end"], old_end + timedelta(days=10))
+            self.assertEqual(child["started"], old_started)
+        self.assertEqual(self.parent["start"], original_parent_start)
+        self.assertEqual(self.parent["end"], self.child_b["end"])
+        self.app._save.assert_called_once_with()
+
+    def test_gantt_resize_clamps_parent_expands_child_and_restores_failure(self) -> None:
+        parent_row = self.app.row_widgets[0]
+        x0, y0, _x1, y1 = parent_row.gantt_bounds
+        self.app._on_gantt_press(
+            self.parent["id"],
+            SimpleNamespace(x=x0 + 1, y=(y0 + y1) / 2, x_root=400, state=0),
+        )
+        pixels_per_day = self.app._gantt_drag.pixels_per_day
+        self.app._on_gantt_motion(
+            self.parent["id"],
+            SimpleNamespace(x_root=400 + pixels_per_day * 5),
+        )
+        self.app._on_gantt_release(self.parent["id"], SimpleNamespace())
+        self._pump()
+        self.assertEqual(self.parent["start"], app_module.date(2026, 7, 6))
+        self.assertEqual(self.child_a["start"], self.parent["start"])
+
+        self.app._select(self.child_b["id"])
+        child_row = next(
+            row for row in self.app.row_widgets if row.entry_id == self.child_b["id"]
+        )
+        _x0, y0, x1, y1 = child_row.gantt_bounds
+        child_a_range = (self.child_a["start"], self.child_a["end"])
+        self.app._select(self.child_a["id"], additive=True)
+        self.app._on_gantt_press(
+            self.child_b["id"],
+            SimpleNamespace(x=x1 - 1, y=(y0 + y1) / 2, x_root=700, state=0),
+        )
+        pixels_per_day = self.app._gantt_drag.pixels_per_day
+        self.app._on_gantt_motion(
+            self.child_b["id"],
+            SimpleNamespace(x_root=700 + pixels_per_day * 10),
+        )
+        self.app._on_gantt_release(self.child_b["id"], SimpleNamespace())
+        self._pump()
+        self.assertEqual(self.child_b["end"], app_module.date(2026, 8, 3))
+        self.assertEqual(self.parent["end"], self.child_b["end"])
+        self.assertEqual((self.child_a["start"], self.child_a["end"]), child_a_range)
+
+        self.app._select(self.parent["id"])
+        schedule_before = copy.deepcopy(self.app.schedule)
+        selection_before = set(self.app.selected_ids)
+        primary_before = self.app.selected_id
+        child_row = next(
+            row for row in self.app.row_widgets if row.entry_id == self.child_b["id"]
+        )
+        x0, y0, x1, y1 = child_row.gantt_bounds
+        self.app._save = Mock(return_value=False)
+        self.app._on_gantt_press(
+            self.child_b["id"],
+            SimpleNamespace(
+                x=(x0 + x1) / 2,
+                y=(y0 + y1) / 2,
+                x_root=800,
+                state=0,
+            ),
+        )
+        pixels_per_day = self.app._gantt_drag.pixels_per_day
+        self.app._on_gantt_motion(
+            self.child_b["id"],
+            SimpleNamespace(x_root=800 + pixels_per_day),
+        )
+        self.app._on_gantt_release(self.child_b["id"], SimpleNamespace())
+        self.assertEqual(self.app.schedule, schedule_before)
+        self.assertEqual(self.app.selected_ids, selection_before)
+        self.assertEqual(self.app.selected_id, primary_before)
+        self.assertEqual(self.app.status_label.cget("text"), "日付変更を元に戻しました。")
+
+    def test_gantt_bar_height_and_measured_labels_follow_row_height(self) -> None:
+        for row_height in (30, 40, 72):
+            self.app.row_content_height = row_height
+            self.app.schedule["settings"]["row_height"] = row_height
+            self.app._rebuild_rows()
+            self._pump()
+
+            parent_row, child_row = self.app.row_widgets[:2]
+            parent_height = parent_row.gantt_bounds[3] - parent_row.gantt_bounds[1]
+            child_height = child_row.gantt_bounds[3] - child_row.gantt_bounds[1]
+            self.assertGreater(parent_height, child_height)
+            self.assertGreaterEqual(
+                child_height,
+                self.app.small_font.metrics("linespace") + 5,
+            )
+            self.assertLess(parent_height, row_height)
+            self.assertTrue(parent_row.gantt_canvas.find_withtag("gantt_bar"))
+            text_items = parent_row.gantt_canvas.find_withtag("gantt_label")
+            self.assertTrue(text_items)
+            x0, _y0, x1, _y1 = parent_row.gantt_bounds
+            text_bbox = parent_row.gantt_canvas.bbox(text_items[0])
+            self.assertGreaterEqual(text_bbox[0], x0)
+            self.assertLessEqual(text_bbox[2], x1)
+            self.assertEqual(
+                parent_row.gantt_canvas.itemcget(text_items[0], "text"),
+                "31日・40%",
+            )
+
+    def test_short_gantt_label_moves_outside_and_parent_colors_show_children(self) -> None:
+        standalone = new_entry(
+            KIND_PARENT,
+            "子を持たない親",
+            "2026-07-25",
+            "2026-07-25",
+            entry_id="standalone-parent",
+            progress_mode="value",
+            progress_value=3,
+            progress_total=4,
+        )
+        self.app.entries.append(standalone)
+        self.app._rebuild_rows()
+        self._pump()
+
+        group_row = self.app.row_widgets[0]
+        child_row = self.app.row_widgets[1]
+        standalone_row = self.app.row_widgets[3]
+
+        def polygon_fills(row) -> list[str]:
+            return [
+                row.gantt_canvas.itemcget(item, "fill").upper()
+                for item in row.gantt_canvas.find_withtag("gantt_bar")
+                if row.gantt_canvas.type(item) == "polygon"
+            ]
+
+        self.assertEqual(
+            polygon_fills(group_row),
+            [app_module.COLOR_PARENT_REMAINING, app_module.COLOR_PARENT_COMPLETE],
+        )
+        self.assertEqual(
+            polygon_fills(child_row),
+            [app_module.COLOR_CHILD_REMAINING, app_module.COLOR_CHILD_COMPLETE],
+        )
+        self.assertEqual(
+            polygon_fills(standalone_row),
+            [
+                app_module.COLOR_PARENT_WITHOUT_CHILDREN_REMAINING,
+                app_module.COLOR_PARENT_WITHOUT_CHILDREN_COMPLETE,
+            ],
+        )
+
+        label_items = standalone_row.gantt_canvas.find_withtag("gantt_label")
+        self.assertEqual(len(label_items), 1)
+        self.assertEqual(
+            standalone_row.gantt_canvas.itemcget(label_items[0], "text"),
+            "1日・75%",
+        )
+        _x0, _y0, x1, _y1 = standalone_row.gantt_bounds
+        label_bbox = standalone_row.gantt_canvas.bbox(label_items[0])
+        self.assertGreater(label_bbox[0], x1)
+
+        self.app._select(standalone["id"])
+        self.assertEqual(
+            polygon_fills(standalone_row),
+            [
+                app_module.COLOR_PARENT_WITHOUT_CHILDREN_REMAINING,
+                app_module.COLOR_PARENT_WITHOUT_CHILDREN_COMPLETE,
+            ],
+        )
+
+    def test_short_gantt_labels_choose_available_side_at_date_limits(self) -> None:
+        left_entry = new_entry(
+            KIND_PARENT,
+            "左端",
+            app_module.date.min,
+            app_module.date.min,
+            entry_id="left-limit",
+        )
+        right_entry = new_entry(
+            KIND_PARENT,
+            "右端",
+            app_module.date.max,
+            app_module.date.max,
+            entry_id="right-limit",
+        )
+        self.app.schedule = {
+            "version": 4,
+            "parents": [left_entry, right_entry],
+            "todos": [],
+            "settings": {"row_height": 40},
+        }
+        self.app._ensure_schedule_defaults()
+        self.app._rebuild_rows()
+        self._pump()
+
+        left_row, right_row = self.app.row_widgets
+        left_label = left_row.gantt_canvas.find_withtag("gantt_label")[0]
+        right_label = right_row.gantt_canvas.find_withtag("gantt_label")[0]
+        left_bbox = left_row.gantt_canvas.bbox(left_label)
+        right_bbox = right_row.gantt_canvas.bbox(right_label)
+        left_x1 = left_row.gantt_bounds[2]
+        right_x0 = right_row.gantt_bounds[0]
+
+        self.assertGreater(left_bbox[0], left_x1)
+        self.assertLess(right_bbox[2], right_x0)
+
+    def test_large_schedule_reuses_render_lookups_and_redraws_changed_selection(self) -> None:
+        parents = [
+            new_entry(
+                KIND_PARENT,
+                f"大量表示 {index + 1}",
+                "2026-07-01",
+                "2026-07-03",
+                entry_id=f"large-parent-{index}",
+            )
+            for index in range(120)
+        ]
+        self.app.schedule = {
+            "version": 4,
+            "parents": parents,
+            "todos": [],
+            "settings": {"row_height": 40},
+        }
+        self.app._ensure_schedule_defaults()
+        with patch.object(
+            self.app,
+            "_timeline_range",
+            wraps=self.app._timeline_range,
+        ) as build_timeline_range:
+            self.app._rebuild_rows()
+            self._pump()
+
+        self.assertEqual(len(self.app.row_widgets), 120)
+        self.assertEqual(len(self.app._row_widgets_by_id), 120)
+        self.assertEqual(len(self.app._row_entries_by_id), 120)
+        self.assertLess(build_timeline_range.call_count, 10)
+        with (
+            patch.object(
+                self.app,
+                "_timeline_range",
+                wraps=self.app._timeline_range,
+            ) as timeline_range,
+            patch.object(
+                self.app,
+                "_find",
+                side_effect=AssertionError("描画中の全件検索は不要です"),
+            ),
+        ):
+            self.app._redraw_all_gantt()
+        timeline_range.assert_called_once_with()
+
+        first_id = parents[0]["id"]
+        last_id = parents[-1]["id"]
+        self.app._select(first_id)
+        with patch.object(
+            self.app,
+            "_redraw_gantt_for",
+            wraps=self.app._redraw_gantt_for,
+        ) as redraw:
+            self.app._select(last_id)
+        self.assertEqual(
+            {item.args[0] for item in redraw.call_args_list},
+            {first_id, last_id},
+        )
+
     def _descendants_of_type(self, widget: tk.Misc, widget_type: type) -> list:
         matches = []
         for child in widget.winfo_children():
@@ -1354,6 +2118,14 @@ class ScheduleAppTkTests(unittest.TestCase):
                 matches.append(child)
             matches.extend(self._descendants_of_type(child, widget_type))
         return matches
+
+    def _cancel_scheduled_callbacks(self) -> None:
+        for after_id in tuple(self.app._after_ids):
+            try:
+                self.root.after_cancel(after_id)
+            except tk.TclError:
+                pass
+        self.app._after_ids.clear()
 
 
 if __name__ == "__main__":

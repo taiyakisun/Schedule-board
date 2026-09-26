@@ -193,6 +193,43 @@ def child_dates_within_parent(
     return parent_start <= child_start <= child_end <= parent_end
 
 
+def child_date_overrun_days(
+    parent: dict,
+    start: date | datetime | str,
+    end: date | datetime | str,
+) -> tuple[int, int]:
+    """Return the days a child extends before and after its parent range."""
+
+    parent_start = _parse_date(parent["start"])
+    parent_end = _parse_date(parent["end"])
+    child_start = _parse_date(start)
+    child_end = _parse_date(end)
+    return (
+        max(0, (parent_start - child_start).days),
+        max(0, (child_end - parent_end).days),
+    )
+
+
+def expand_parent_to_include_child_dates(
+    parent: dict,
+    start: date | datetime | str,
+    end: date | datetime | str,
+) -> bool:
+    """Expand a parent range in place so it contains the child range."""
+
+    parent_start = _parse_date(parent["start"])
+    parent_end = _parse_date(parent["end"])
+    child_start = _parse_date(start)
+    child_end = _parse_date(end)
+    expanded_start = min(parent_start, child_start)
+    expanded_end = max(parent_end, child_end)
+    if expanded_start == parent_start and expanded_end == parent_end:
+        return False
+    parent["start"] = expanded_start
+    parent["end"] = expanded_end
+    return True
+
+
 def clamp_children_to_parent(parent: dict) -> bool:
     """Clamp every child range to the parent range in place."""
 
@@ -209,6 +246,83 @@ def clamp_children_to_parent(parent: dict) -> bool:
             child["end"] = clamped_end
             changed = True
     return changed
+
+
+def clone_entry_tree(entry: dict, parent_id: str | None = None) -> dict:
+    """Clone a schedule entry with fresh IDs while preserving its data."""
+
+    kind = entry.get("kind")
+    if kind not in (KIND_PARENT, KIND_CHILD):
+        raise ValueError(f"unsupported entry kind: {kind}")
+    cloned = copy.deepcopy(entry)
+    cloned_id = str(uuid4())
+    cloned["id"] = cloned_id
+    if kind == KIND_PARENT:
+        cloned["parent_id"] = None
+        cloned["children"] = [
+            clone_entry_tree(child, cloned_id)
+            for child in entry.get("children", [])
+        ]
+    else:
+        target_parent_id = parent_id or entry.get("parent_id")
+        if not target_parent_id:
+            raise ValueError("a cloned child entry requires parent_id")
+        cloned["parent_id"] = str(target_parent_id)
+        cloned.pop("children", None)
+    return cloned
+
+
+def shift_entry_range(entry: dict, days: int, include_children: bool = False) -> bool:
+    """Shift an entry range, optionally including every direct child."""
+
+    amount = int(days)
+    if amount == 0:
+        return False
+    targets = [entry]
+    if include_children and entry.get("kind") == KIND_PARENT:
+        targets.extend(entry.get("children", []))
+    shifted_ranges = []
+    for target in targets:
+        start = _parse_date(target["start"])
+        end = _parse_date(target["end"])
+        start_ordinal = start.toordinal() + amount
+        end_ordinal = end.toordinal() + amount
+        if not 1 <= start_ordinal <= date.max.toordinal() or not 1 <= end_ordinal <= date.max.toordinal():
+            raise ValueError("shifted schedule dates exceed the supported range")
+        shifted_ranges.append(
+            (target, date.fromordinal(start_ordinal), date.fromordinal(end_ordinal))
+        )
+    for target, start, end in shifted_ranges:
+        target["start"] = start
+        target["end"] = end
+    return True
+
+
+def resize_entry_range(entry: dict, edge: str, days: int) -> bool:
+    """Move one range edge while preserving a minimum one-day schedule."""
+
+    if edge not in ("start", "end"):
+        raise ValueError(f"unsupported range edge: {edge}")
+    start = _parse_date(entry["start"])
+    end = _parse_date(entry["end"])
+    if edge == "start":
+        new_ordinal = max(1, min(end.toordinal(), start.toordinal() + int(days)))
+        new_start = date.fromordinal(new_ordinal)
+        if new_start == start:
+            return False
+        entry["start"] = new_start
+    else:
+        new_ordinal = min(
+            date.max.toordinal(),
+            max(start.toordinal(), end.toordinal() + int(days)),
+        )
+        new_end = date.fromordinal(new_ordinal)
+        if new_end == end:
+            return False
+        entry["end"] = new_end
+    if entry.get("kind") == KIND_PARENT:
+        clamp_children_to_parent(entry)
+    return True
 
 
 def _stable_id(seed: str) -> str:
